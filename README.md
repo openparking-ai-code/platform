@@ -1,0 +1,2660 @@
+# Open Parking AI — platform
+
+The multi-tenant server behind Open Parking AI: tenants, sites, rules, pricing and the
+event record that lane controllers report into.
+
+Every tenant-owned table is isolated twice over — once by application-level scoping and
+again by Postgres row-level security, enabled and **forced** from migration 0001. The
+database refuses to leak across tenants even if the application layer forgets to ask
+correctly. That guarantee is tested, and the test is proven to fail when RLS is removed.
+
+A card number never passes through this code. Payments are processor-tokenized only; any
+change that handles raw card data is rejected on review.
+
+## Stack
+
+Node / Express / Postgres 16.
+
+## Quick start
+
+```sh
+npm install
+cp .env.example .env
+npm run prepare-database        # as a superuser, once: the owner, the database, 0001, the app role
+npm run migrate                 # every other migration, as the owner
+npm test
+```
+
+## Why two database URLs
+
+`DATABASE_URL` is the owner connection. It runs migrations and nothing else. The owner
+must be **NOSUPERUSER and NOBYPASSRLS** — an ordinary role that owns the schema, so every
+`FORCE`d policy binds it too; the three functions that must look across accounts open
+exactly that lookup for themselves (migration 0031), and CI migrates as such an owner so a
+function that leans on seeing past a policy fails there first.
+
+`APP_DATABASE_URL` is what the application and the tests connect as, and it points at a
+role created `NOSUPERUSER NOBYPASSRLS`. This is load-bearing, not ceremony: **a Postgres
+superuser bypasses row-level security unconditionally** — `FORCE ROW LEVEL SECURITY` does
+not stop one. An isolation test run as a superuser sees every tenant's rows whether the
+policies are present or absent, so it proves nothing in either direction. Connecting as an
+unprivileged role is what makes the test mean something.
+
+### The one step that needs a superuser
+
+`npm run prepare-database`, with `SUPERUSER_URL` set to a superuser on the cluster. It is
+the only step that uses one, and it is separate from `migrate` because of migration 0001:
+0001's first statement gives the application role `NOSUPERUSER NOBYPASSRLS`, and Postgres
+lets only a superuser change `SUPERUSER`, even to say no. So on a cluster where
+`openparking_app` already exists, an ordinary owner cannot run 0001 — and 0001 is applied
+everywhere and is never edited. `prepare-database` therefore:
+
+1. makes the owner (`DATABASE_URL`'s role, NOSUPERUSER NOBYPASSRLS) if it is missing, and
+   refuses an existing one that is a superuser or BYPASSRLS — it never alters it;
+2. makes the database, owned by the owner, if it is missing;
+3. applies 0001 to a database that has not got it, hands the three things it makes
+   (`tenants`, `parking_sites`, `current_tenant_id()`) to the owner and records it, so
+   `npm run migrate` starts at 0002 and the owner owns everything;
+4. gives `openparking_app` its login and `APP_DB_PASSWORD`, NOSUPERUSER NOBYPASSRLS
+   NOCREATEDB NOCREATEROLE, and refuses it if it is a member of the owner.
+
+Run it once for a new database; again whenever the application role's password changes.
+`npm run migrate` as an ordinary owner refuses a database without 0001 and names this step.
+
+See [docs/RLS_TEMPLATE.md](docs/RLS_TEMPLATE.md) for the pattern every new tenant-owned
+table follows, and [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md) for what is stored about
+vehicles and how long it is kept.
+
+## Watch a car drive through
+
+```sh
+npm run demo          # prepare-database, migrate, a demo garage, server on :3000
+```
+
+It prints a tenant, a garage and two device tokens, and writes them to
+`.demo-credentials.json`. Then, from the
+[lane-controller](https://github.com/openparking-ai-code/lane-controller) repository:
+
+```sh
+python -m lane_controller.demo --credentials ../platform/.demo-credentials.json
+```
+
+A simulated car arms the loop, is identified, is allowed, the gate vends, and a
+session opens once the entry is settled; it leaves and the session closes with the
+fee computed. The demo lane has no closing loops, so its entries settle as
+`unconfirmable` — see below.
+
+## What the lane talks to
+
+| | |
+|---|---|
+| `GET /api/v1/lane/rules` | what the lane caches so it can decide offline: the garage's plans whole, its space class, each linked module's register, the open stays with a cursor — the slow cadence |
+| `GET /api/v1/lane/stays?since=<cursor>` | every stay changed since the cursor, closed rows included — the fast cadence; without `since`, the full open set; every answer also carries the lane's own `lane` state and `board` |
+| `POST /api/v1/lane/events` | append lane activity; idempotent on `event_id` (1-64 of `A-Za-z0-9_-`) |
+| `POST /api/v1/lane/redeem-enrolment` | a QR shown at the lane: garage-pass binds the car or says why not; `open` only on covered; rate-limited per device; the token is kept nowhere |
+| `POST /api/v1/lane/sessions/open` | entry; idempotent on `event_id`; requires `entry_confirmation`; carries and echoes an optional `descriptor`, and an optional `tailgater`; identified by a plate, a ticket, or `plate_unreadable: true` (0036), with an optional `no_open_command` and, for an unread car, `unsure_plate` and its confidence; `event_id` 1-64 of `A-Za-z0-9_-` |
+| `POST /api/v1/lane/pictures` | a picture kept with an entry: `{picture_ref, event_id, taken_at, image}`, the image base64, a JPEG or a PNG, at most 3 MiB; idempotent on `picture_ref` |
+| `POST /api/v1/lane/sessions/close` | exit; computes and freezes the fee; idempotent on `event_id` (1-64 of `A-Za-z0-9_-`); requires `exit_confirmation`; carries and echoes an optional `descriptor` |
+
+### A stay is identified by a plate or by a ticket — exactly one
+
+The camera used to be the only way into the record. A driver whose plate could
+not be read had no identity for a session to open on, so the intercom had
+nothing to hand this platform even after a human had decided to let the car in.
+
+`vehicles` now carries **exactly one** of:
+
+| | |
+|---|---|
+| `plate` | a plate a camera **read** |
+| `ticket_ref` | an identity a display or a person **asserted** |
+
+Every route that opens, finds or closes a stay takes either, in the same
+exactly-one form — `POST /lane/sessions/open`, `GET /lane/sessions/open`
+(`?plate=` or `?ticket_ref=`) and `POST /lane/sessions/close`. **A lane that
+sends only a plate is unchanged**, and a test asserts that end to end.
+
+Sending **both** is refused. A row carrying a plate and a ticket would be
+claiming this platform established they belong to the same vehicle, and nothing
+here can: the plate is a measurement and the ticket is an assertion. Binding the
+two is the identity module's job, and `vehicles_exactly_one_identity` is what
+keeps it from being done accidentally in this one.
+
+**A `ticket_ref` is opaque here.** What is checked is a closed alphabet and a
+length — 6 to 64 characters of `A-Z`, `0-9` and hyphen — and nothing else: no
+signature, no expiry, no issuer. The agent that mints and verifies tickets is a
+different module. This platform's whole claim about a ticket is that it is
+unique per tenant and that it looks like one.
+
+It is personal data on the same terms a plate is, and the retention purge
+redacts it on the same window — see
+[docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+**And a car whose plate nobody could read (0036).** The rule: every car
+that crosses a lane's activation loop and then its closing loop is a stay,
+whatever opened the barrier, and "unreadable" is part of the car's identity,
+not a failure to have one. Such a car had no identity to open a stay on, so it
+got into the garage and into no record. An entry's open now takes, instead of a
+plate or a ticket, `plate_unreadable: true` — alone, and only `true`: beside a
+plate it would say the plate was both read and not, and beside a ticket it
+would be two cars, so either is a `400`. The stay's vehicle carries neither a
+plate nor a ticket but `unread_ref`, the open's own event id: **one row per
+unread car**, because nothing here can say two unread cars are the same car and
+a vehicle with an open stay takes no second one — a shared "unreadable" row
+would fold every unread car in the garage into the first one's stay. A replayed
+open is the same row and the same stay. The database holds the rule too
+(`vehicles_exactly_one_identity` over three columns, `vehicles_tenant_unread_ref_key`).
+The close by plate and the exit's lookup take a plate or a ticket, as before;
+an unread car's stay is found and closed through its **exit case** (0037,
+below), by the car's ID. A car counts as inside from its entry to its exit,
+with no age-out. The stay counts
+among the cars inside (0034) and is on the lane's feed with no plate and no
+ticket.
+
+**What was seen is kept, and is not an identity.** Beside `plate_unreadable`
+the open may carry `unsure_plate` and `unsure_plate_confidence` -- what the
+camera read below the lane's confidence, and that confidence, both or neither
+-- held on the stay as `entry_unsure_plate` for the exit's matching. No route
+finds a stay by it, nothing compares it to a plate, and no ban lists it; the
+purge nulls it with the stay's descriptors. Beside a plate or a ticket it is a
+`400`. **`no_open_command: true`** says the lane's loops saw the car go in and
+no open command let it in; it is its own field, and `tailgater` keeps its own
+meaning (*Pictures, tailgaters and banned cars*): an unread open that says
+`tailgater: true` is stored as not one, and opens all the same. **A lane's
+`event_id`** -- on the open, the close and every log event -- is 1 to 64
+characters of letters, digits, hyphen and underscore, or a `400`: the open's
+is now the key an unread car's vehicle is held under, so an object coerced to
+text, a value shaped like the purge's `redacted:` or an unbounded string is
+refused. Our lane's UUIDs and another lane's own ids (`tp-0001`) fit. `npm run unread-identity-fail-control` breaks
+each property in turn.
+
+### Every session records what saw the car
+
+A ticket is not an entry. A driver can pull up, take one and drive away, and a
+vend with nothing behind it is not an arrival at all — so every abandoned
+approach used to become a phantom occupant, counted as inside and never seen
+again. The lane now creates a pending entry at the vend and promotes it when the
+loops after the barrier see the vehicle: two confirmation loops crossed forward,
+or, as a fallback that does not see direction, the gate's own closing loop, read
+through its detector's second output.
+
+`entry_confirmation` is **required and never defaulted**, and it says which:
+
+| | |
+|---|---|
+| `confirmed` | two loops after the barrier saw it cross them forward, inside the lane's window (the standard installation, `closing_loops: 2`; crossed backward is a car backing out, never confirmed); or, at a fallback lane with no pair, the gate's own closing loop read a vehicle after the vend (`closing_loops: 1`). The lane's `entry_confirmed` event says which, in its reason and its `geometry_assumed`. One loop does not see which way the car then went: a car that reaches it and backs out keeps an open stay with no exit |
+| `unconfirmable` | that lane has no closing loops, so nothing could confirm or refute it |
+
+The response **echoes the value back**, and that is a contract term rather than a
+convenience: a platform older than the column accepts the same call and drops the
+field, so the lane treats an open that does not echo what it sent as undelivered.
+
+### A session carries the appearance descriptor its entry read produced
+
+The exit module matches an exiting car to a **stay** by comparing one descriptor
+against the descriptors of every open stay in the garage. This is the entry
+half: a lane whose identity service produced a descriptor sends it on the open
+as `descriptor`, and the platform holds it on the session as `entry_descriptor`
+(migration 0009).
+
+A descriptor is an opaque, versioned, compact value produced by the identity
+service (`opvid-opa-id/<version>:…`). It is not an image, a photograph cannot be
+reconstructed from it, and this platform does not parse it: what is checked is
+that it is a string, not blank, and at most 64 KiB (a bound with its reason
+given in `src/app.js`).
+
+**It is optional, and absent means NOT MEASURED.** The identity service produces
+one only when a deployment asks for it, so a lane with it switched off — the
+default — sends none and is unchanged, and every row written before the column
+carries `null`.
+
+**The response echoes it back, and that is the contract term.** This route
+destructures the keys it knows and ignores the rest, so a platform older than
+the column accepts the same call with a `201` and drops the field — silently,
+which is worse than a refusal because nothing reports it. The lane treats an
+open whose response does not carry the descriptor it sent as undelivered,
+exactly as it does for `entry_confirmation`. A fail control
+(`npm run entry-descriptor-fail-control`) turns the suite red when the field is
+ignored, not stored, not echoed, unbounded, or left behind by retention.
+
+**It is identity, and retention reaches it.** It describes one specific car's
+appearance, so it is personal data on the same terms the plate is: the purge
+nulls it on the sessions of every vehicle it redacts, on the same window, in
+the same run — see [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+**The exit's descriptor rides the CLOSE, and no other channel.** A lane whose
+exit read produced one sends it on `POST /lane/sessions/close` as `descriptor`,
+and the platform holds it as `exit_descriptor` (migration 0010), echoes it, and
+redacts it with the entry one. The exit reaches this platform on two channels
+that arrive in no specified order — the sessions sync and the events ingest —
+and the shadow search snapshots the open stays *inside* the close transaction,
+before `exit_at` is written; on the events channel the descriptor could land
+after the stay was already closed, and every plate-matched exit would read as
+"absent true car". One channel, one ordering. A stay that has not exited holds
+no exit descriptor — `sessions_exit_descriptor_needs_exit`, checked at the
+database and not only at the route.
+
+### The candidate set
+
+The exit module's search takes one descriptor and a list of `{id, descriptor}`
+candidates and answers "which of *these*, if any?" — and the list it must be
+given is every stay that could be the one leaving: every stay still open in the
+garage the exit lane belongs to. `src/candidates.js` is that list.
+
+**Keyed on the session**, because what an exit needs back is which *stay* to
+close. Each candidate carries what identifies it — exactly one of `plate` or
+`ticket_ref` (named as `identity_kind`), the region and the vehicle attributes
+the entry read produced — beside the stored `descriptor`, so a later round can
+say which stay the plate picked without a second query. `forSearch` projects
+that down to what the identity service is sent: `{id, descriptor}` for exactly
+the stays that **have** a descriptor, and no plate, ticket or attribute — its
+contract says no plate is involved.
+
+**The denominator travels with the set.** Only plate- or ticket-identified cars
+ever get a session, and the descriptor is opt-in at the identity service, so a
+stay may be open with none. `open` and `with_descriptor` are on the result
+because a figure produced over this set has to be written beside them.
+
+**It runs on the caller's client.** The consumer that matters reads the set
+*inside* the close transaction, before `exit_at` is written, so the stay that
+is leaving is still open and in it. There is no operator route for it.
+
+### The shadow run
+
+The search is called for real exits, its answer **recorded**, and nothing acts
+on it. Two halves, with a row in `shadow_searches` (migration 0011) between them.
+
+**The snapshot is taken inside the close, before `exit_at` is written.** A
+close that carries a descriptor reads which stays are open and comparable in
+the same transaction, after the stay to close is found and before it is
+closed, and writes them as **session ids and counts** — nothing heavier. That
+was measured, not preferred: at 5,000 open stays with real-size descriptors the
+full candidate set is 62 MB inside the close transaction; ids and counts are
+1.2 MB. A descriptor is immutable once written, so the worker reads them by id
+later; which stays were open *before* the close is the one thing that cannot
+be re-read, and it is the one thing the close holds. A snapshot taken after the
+close finds the true stay already gone, and every plate-matched exit reads as
+"absent true car" — the fail control puts that ordering back and the suite goes
+red.
+
+**The worker runs later, outside any request** — `npm run shadow-search`, on a
+schedule beside the purge. It needs `VEHICLE_ID_URL` (the identity service's
+search route, on loopback or a tokened bind: `VEHICLE_ID_TOKEN_FILE`) and the
+two thresholds the search is told to apply, `SHADOW_THRESHOLD_STRUCTURE` and
+`SHADOW_THRESHOLD_COLOUR` — **required, never defaulted**, because no operating
+point has been measured for the descriptor on real entry-and-exit photographs.
+It sends `{id, descriptor}` per candidate and nothing else, and writes the
+outcome onto the row and a `shadow_search` event beside it: **session ids,
+never descriptors** — `events` is append-only by grant and outside the
+retention purge. A search that cannot be obtained leaves the row pending and
+counted, and is retried. **Retention reaches the row:** when the purge redacts
+the stay it shadowed, the session references go and the outcome and counts
+stay, so the figure survives the identity — see
+[docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+**What may be published** — `npm run shadow-report <tenant> <garage>`. Every
+figure names its denominator and its oracle: on every row the close picked the
+stay by plate or ticket independently of the search, so whether the search
+named that stay is a measurement with ground truth — over plate- or
+ticket-identified cars only, inheriting the plate reader's own errors. The four
+rates (match, wrong match, tie, no match) partition the rows where the true
+stay was comparable; a tie that includes the true stay is a tie, not a match.
+**A match rate over all exits is not measurable here** — a close that matches
+nothing answers 404 and inserts no row — and none is published.
+
+**Nothing decides anything.** No vend, fee or session is touched by an outcome.
+The identity service this needs — one serving the search route on the platform
+host — is a deployment dependency and is not started by anything here.
+
+`exit_confirmation` is the same question about the other end of the stay, with
+one more value:
+
+| | |
+|---|---|
+| `held` | the exit vended and nothing confirmed a crossing. It closes and bills anyway — the barrier opened and the car is gone — carrying the flag, with an `exit_held` lane event beside it |
+
+Entries that were backed out of or never confirmed are **not sessions** — no
+session, no occupancy, no money. They are lane events and they land in `events`.
+
+`inside_count` on the operator surface counts CONFIRMED sessions. The rest are
+not hidden: `unconfirmable_count` and `open_count` are returned beside it.
+
+Every one of those is idempotent on purpose, and idempotent **on the lane's
+event id — never on state**. A lane that has been offline re-sends whatever it
+could not confirm, so duplicate delivery is the normal case, not an error case.
+
+State is not a key. An entry replayed after the car has already left finds no
+open session, and a state-based check opens a second one: a phantom that never
+exits and corrupts the garage's inside-count permanently. `event_id` is
+required on every session call for that reason.
+
+Times come from the **lane**, never the server clock — the car may have arrived
+while the lane had no network. The fee, and the plan version and breakdown that
+produced it, are frozen onto the session at exit, so a later version cannot
+silently reprice history.
+
+### What this platform can and cannot establish
+
+The platform records what a lane device reports, and holds no evidence of its
+own. A device token IS that lane's identity: it resolves server-side to one lane
+and one direction, so an entry token attempting a close and an exit token
+attempting an open are both refused `409` — run against this code, both ways,
+rather than promised. What is checked here is shape, direction, ordering (an
+exit before its own entry is refused). What cannot be checked from here is that
+a vehicle was ever there: the lane's loops and camera are the only things
+that see a car, so **a stolen device token is a stolen lane**, and every record
+it writes is indistinguishable from a real one. Binding a session to physical
+evidence is not built.
+
+## Operator surface
+
+Authenticated by an operator token; the tenant comes **from the token**. There is
+no HTTP route that mints one — `npm run issue-operator-token <tenant-id> "<name>"`
+needs database access, deliberately, because a token is what unlocks the surface.
+`GET /api/v1/auth/me` with an operator token as Bearer answers `{kind: "key", tenant_id}`
+and nothing more, so a server holding a company's token can check which company it belongs to; a
+revoked or unknown token, or a session token sent as Bearer, is 401 as on every operator route.
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/sessions/open
+```
+
+### The owner signs in
+
+**One admin per tenant**: an email and a password, and nothing else — no roles,
+no user management and **no sign-up**: an admin is made only by an emailed
+invite the deployment's operator sends (`invite-admin`, below) or at the
+database (`create-admin`). This repository sends email for exactly three
+things: that invite, a link to choose a new password, and a notice that an
+invite was accepted (migration 0032; "Invites, and a forgotten password",
+below). A sign-in **is a session token**, minted the way operator tokens are (random 32
+bytes, only its SHA-256 stored), so every operator route works unchanged behind
+it (migration 0024).
+
+    POST /api/v1/auth/sign-in    {email, password}  ->  200 {email, tenant_id, session_ends_at, language} and the cookie
+    POST /api/v1/auth/sign-out   revokes the session row                 ->  204
+    GET  /api/v1/auth/me         {email, tenant_id, session_ends_at, language}
+    PUT  /api/v1/auth/language   {language}         ->  200 {language}
+
+**The owner's language** (migration 0025) is kept on the admin's own row:
+`en` unless the owner chose `es`, and every admin made before 0025 is `en`. The
+database refuses any other value. `PUT /api/v1/auth/language` changes it for the
+signed-in admin only: the admin and the tenant are the session's, and nothing
+else in the body is read, nor the query: `?language=es` never stands in for a
+body that names no language. It follows the cookie's rules below
+(the `Origin` must be `ADMIN_ORIGIN`), and anything but `{"language": "en"}` or
+`{"language": "es"}` sent as JSON is refused `400 language_refused` and changes
+nothing. The admin screens read it from sign-in's answer, so the owner's screens
+speak their language on any computer.
+
+**The admin is made at the database, never over HTTP**, as an operator token is:
+
+```sh
+npm run create-admin -- --tenant <tenant-id> --email <email>            # prompts, twice, no echo
+npm run reset-admin-password -- --email <email> --password-file <path>  # or from a file
+```
+
+The password **never arrives on the command line** — argv is in the process
+list — and a password argument, in any spelling, is refused by name. It is at
+least 12 characters; length is the one rule. A reset revokes every session of
+that admin and clears every lock on it. Apart from the revoke, a session issued
+before the admin's password last changed (`password_changed_at`) is never found
+again, revoked or not. The database sets `password_changed_at` itself whenever
+the hash changes, so **any change of the hash, by any path** — the reset
+command, or SQL by hand that sets the hash alone — ends every session signed in
+before it. A sign-in still checking the old password when the change lands is
+refused like any refusal and gets no session: one is made only while the hash it
+checked is still the admin's, with the admin's row held from that reading until
+the session is written. There is no change-password route yet;
+that comes with the account page.
+
+**The cookie** is `op_session`: `HttpOnly` (page script can never read it),
+`Secure`, `SameSite=Strict`, `Path=/`, no `Domain`. So **the admin site is
+served from the same origin as `/api`** — there is no CORS here. `Path=/` (it was
+`/api` until 2026-10-15) so that owner pages served beside the admin, such as the
+garage map at `/garage-map/`, can be gated at the proxy by `GET /api/v1/auth/me`;
+every set and clear also removes a `Path=/api` cookie an earlier version left, since
+a browser holding both would send `op_session` twice, which reads as no session. `Secure` may be
+turned off only by `SESSION_COOKIE_INSECURE=true`, for plain-http local
+development, and `serve` says so out loud when it is.
+
+**The operator router takes a Bearer key (unchanged) or the cookie.** A request
+the cookie authenticates that **changes** something (POST, PUT, PATCH, DELETE)
+must carry an `Origin` equal to `ADMIN_ORIGIN`, or it is refused `403
+origin_refused` before the session is looked up. With no `ADMIN_ORIGIN` set,
+sign-in is off and answers `409 sign_in_not_configured`. A sign-in with a
+foreign `Origin` is refused, and one not sent as JSON cannot be read. A session
+token presented as a Bearer key is not a key.
+
+**A session ends** 30 minutes after its last use and 12 hours after sign-in,
+whichever is first (`SESSION_IDLE_MINUTES`, `SESSION_MAX_HOURS`). An ended
+session answers `401 session_ended`, so the screen can say what happened, and
+presenting it again revives nothing.
+
+**Guessing.** Ten wrong passwords **from one caller address** lock that address
+out of that account for 30 minutes; wrong passwords during the lock still count
+and re-arm it. Once a lock has ended the count starts again: the next wrong
+password counts as 1, and it takes ten again to lock. Other addresses are unaffected, so knowing the admin's email is
+not enough to keep the admin out — there is no account-wide lock. Separately,
+each address gets `SIGN_IN_ATTEMPTS_PER_ADDRESS` attempts (default 30) per
+`SIGN_IN_ATTEMPTS_WINDOW_MINUTES` (default 15), held in this process, then `429
+sign_in_rate_limited`. The address is the **socket's**; `X-Forwarded-For` is
+read only when `TRUST_PROXY` is declared: a number of proxy hops from 1 to 5,
+`loopback`, or a comma-separated list of the proxies' addresses or subnets.
+`true`, and any other form, refuses to start: it means "trust whatever the
+caller says". ⚠ **A number of hops must equal the real number of proxies in
+front of this server.** The server cannot see the chain and cannot check it.
+If the number is larger than the real chain, the caller writes the address
+that is used: a forged `X-Forwarded-For` chooses which address is counted, so
+one caller can dodge the lock and the attempt limit by changing it. Smaller,
+and every caller is counted as a proxy. The start-up line says the same. An
+IPv6 address counts by its /64. ⚠ **Behind a proxy with no
+`TRUST_PROXY`, every caller is the proxy, so the lock is in effect
+account-wide** — declare it. Likewise, **people who share one address (one
+office NAT, one carrier gateway) share one lock**: ten wrong passwords from any
+of them lock all of them out of that account for the window.
+
+**No oracle.** An unknown email, a wrong password and a locked address answer
+the same `401 sign_in_refused`, byte for byte, and each runs exactly one hash
+and the same database statements (the lock lookup and the failure write, which
+for an unknown email find and write nothing). The decoy hash an unknown email
+is checked against is finished before the port opens, so this holds for the
+first sign-in after a start too. No sign-in refusal of any kind is
+answered sooner than `SIGN_IN_REFUSAL_FLOOR_MS` (default 500) after the request
+arrived, so what difference is left in the work is not on the wire.
+
+**Waiting.** Hashes run four at a time (Node's thread pool). The line for them
+is capped: `SIGN_IN_HASH_LINE` sign-ins at once (default 48, about 2 seconds at
+about 26 hashes a second) and `SIGN_IN_HASH_LINE_PER_ADDRESS` of them from one
+address (default 2). A sign-in that finds the line full is answered at once,
+held to the floor, with `503 sign_in_busy` and `Retry-After: 2` — decided before
+the email is read, so the same for every email — instead of waiting behind
+everyone else's.
+
+**Settings are checked at start.** Every setting above is a whole number in its
+range, or one of its stated forms, or `serve` refuses to start, naming the
+setting and the range (`.env.example` lists each). Idle may not be longer than
+the end, nor the per-address share longer than the line.
+
+**Nothing secret is written out.** The password, the token, the cookie and the
+stored hash appear in no log line and no response body. A body that cannot be
+read answers one fixed sentence (`400 sign_in_unreadable`), never the JSON
+parser's text, which quotes what was sent; a failure inside sign-in is logged by
+its class and code, never its message. Every operator and auth response carries
+`Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. No auth route
+takes a credential in its path or query.
+
+**The password hash** is `node:crypto` scrypt (no dependency), stored with its
+own parameters; a stored string in a format this code does not know is refused
+by name and never compared. The parameters were measured with `npm run
+measure-scrypt` (`src/passwords.js` names the machine). Each hash at N=2¹⁷ takes
+128 MiB; Node runs at most its thread pool's worth at once.
+
+⚠ **Deploy rule: never turn on statement or parameter logging** (`log_statement`
+other than `none`/`ddl`, `log_min_duration_statement` with parameters,
+`log_parameter_max_length`, an extension that records parameters) **on a database
+that holds `operator_users`.** Creating an admin and resetting a password write
+the stored hash as a bind parameter, so such a log holds every admin's hash:
+an offline guessing target that no lock and no limit here can slow down.
+
+**The admin commands** refuse a password file whose permission bits let anyone
+but its owner read or write it (`chmod 600` it), or whose folder's permission
+bits let anyone but its owner write there, unless that folder is sticky (as
+`/tmp` is): whoever can write the folder can put another file in its place.
+That is the folder named and, when a link is named, the folder of the file it
+points to. **Only permission bits are checked; ACLs are not read**, so a file
+or folder an ACL opens to others is not refused. A refusal never repeats an
+argument back: an unknown option may be a password (`-p<password>` is one word).
+
+**An id in the address that is not a uuid** answers what an id naming nothing
+answers on that route (404 and its not-found body; on the lane's validation
+claim, `409 stay_not_open`). The database is reached only to authenticate the
+caller. The body is NOT checked first: every request's body is read (up to
+1 MB) before any route runs, before authentication too, so a request whose body
+cannot be read answers that, whatever its id, and an unauthenticated request's
+body is read before its 401. A body that cannot be read answers one sentence,
+`400 body_unreadable` or `413 body_too_large`, with `no-store` and `nosniff`,
+on every path in any letter case, never the parser's own words, which quote
+what was sent.
+
+**A body whose bytes are not UTF-8 is a body that cannot be read.** It is
+refused before anything decodes it, so a byte the caller sent is never stored
+as `U+FFFD` in its place: `400 body_unreadable` on the operator and lane
+surfaces, each sign-in, invite and reset door's own unreadable sentence under
+`/api/v1/auth`, and the language door's own `400 language_refused`. A `U+FFFD`
+the caller actually sent is valid
+UTF-8 and is their text. This platform reads UTF-8 only, deliberately: a body
+that declares another charset, `utf-16` among them, is refused the same way,
+because bytes that are valid UTF-8 can still read as UTF-16 to a lone
+surrogate, which is stored as `U+FFFD` too. One check, `src/utf8Body.js`, on
+every JSON parser here.
+
+`test/owner-sign-in.test.js`, `test/admin-cli.test.js` and
+`test/owner-sign-in-output.test.js` hold each of these; `npm run
+owner-sign-in-fail-control` breaks each one in turn.
+
+### Invites, and a forgotten password
+
+**Sign-up is by invitation only.** The deployment's operator invites the one
+admin of a new tenant at the database, as `create-admin` is run:
+
+```sh
+npm run invite-admin -- --name "<company>" --email <email> [--language es]
+npm run invite-admin -- --resend <email> [--language es]
+```
+
+The first makes the tenant, an invite for the email, and sends the invite
+email — all of it or none: with no email configured, no `ADMIN_ORIGIN` for the
+link to lead to, or a send the email service refuses, it says so in one line
+and stores nothing. The second replaces the waiting invite of that email with
+a new one and sends it: the earlier link then says "replaced". Each prints one
+line, `invited <email> for tenant <id>; the link ends <date>`, and **never the
+link**, which goes to the inbox only. Its arguments follow `create-admin`'s
+rules: a password argument, an unknown option and a bare value are refused,
+and a refusal never repeats what was typed. An email that already names an
+admin, or already has an invite waiting, is refused by name.
+
+**The link is a credential, and it is never stored or logged.** It carries 32
+random bytes (`opi_…` an invite, `opr_…` a reset); only their SHA-256 is kept
+(migration 0032), so a copy of the database holds no link that works. The
+token rides in the URL **fragment** — `<ADMIN_ORIGIN>/#invite=<token>`,
+`<ADMIN_ORIGIN>/#reset=<token>` — which a browser never sends, so neither a
+proxy nor this server can log it; the admin screen reads it there and sends it
+back in a POST body. **An invite lasts seven days and works once**; a tenant has
+at most one live invite and an email at most one, held by the database. **A
+reset link lasts one hour and works once**; asking again replaces it. An invite
+and a reset are two tables and never share a slot.
+
+    POST /api/v1/auth/invite/status  {token}                     ->  200 {status, message[, email, language, expires_at]}
+    POST /api/v1/auth/invite/accept  {token, password, language} ->  200 {email, tenant_id, session_ends_at, language} and the cookie
+    POST /api/v1/auth/forgot         {email}                     ->  200 {message}
+    POST /api/v1/auth/reset          {token, password}           ->  200 {email, message}
+
+`status` is `ready`, `used`, `expired`, `replaced` or `invalid`, each with one
+plain sentence for the screen; `email`, `language` and `expires_at` only when
+ready. **Accept** takes the password under sign-in's rule (12 to 1024
+characters) and the language (`en` or `es`), makes the admin, marks the invite
+used and signs them in, as sign-in does; an invite that is not ready is refused
+`409 invite_<status>` and makes nothing, a password outside the rule `400
+password_refused`. The address in `EMAIL_NOTICE_TO` is told, by email, that
+the invite was accepted. **Forgot** answers the same sentence, byte for byte,
+whether or not the email names an admin, after the same database statements
+(an unknown email's find and write nothing, as sign-in's do), and the reset
+email is sent after the answer, so its round trip is not on the wire. **Reset**
+sets the new password, ends every session of the admin and clears every lock
+on it, as `reset-admin-password` does; it signs nobody in. A link that is not
+ready is refused `409 reset_<status>`.
+
+The four doors keep sign-in's rules: with no `ADMIN_ORIGIN` they answer `409
+sign_in_not_configured`; a foreign `Origin` is refused `403 origin_refused`; a
+body that is not JSON of the door's exact shape answers one fixed sentence
+(`400 invite_unreadable`, `forgot_unreadable`, `reset_unreadable`), never the
+parser's; no door has a path parameter or reads the query. **No answer of any
+of them comes sooner than `SIGN_IN_REFUSAL_FLOOR_MS`** after the request
+arrived. Each door counts its own attempts per caller address, the address
+sign-in counts: `ACCOUNT_LINK_ATTEMPTS_PER_ADDRESS` (default 10) per
+`ACCOUNT_LINK_ATTEMPTS_WINDOW_MINUTES` (default 60), then `429
+link_rate_limited`. Accept and reset hash a password in a place in sign-in's
+hash line (`503 link_busy` when it is full).
+
+**Email** is one `fetch` to the email service's HTTP API (Resend's, unless
+`EMAIL_API_URL` names another), with no dependency (`src/email.js`), in plain
+text, in English or Spanish (`src/emailText.js`): the invite in the invite's
+language, a reset in the admin's own.
+
+    EMAIL_KEY_FILE    the file holding the service's key, mounted as a secret (an absolute path)
+    EMAIL_FROM        the sender: an address, or Name <address>
+    EMAIL_NOTICE_TO   who is told that an invite was accepted (optional)
+    EMAIL_API_URL     where the service takes a message (optional)
+
+The key is read from its file at each send, never from the environment, and
+never written out; no address of anyone's is written in this repository, each
+is a setting. The first two are set together or not at all; with neither,
+`serve` says that email is off, and a reset is asked for in vain. A setting
+that is not one of its forms, or a key file that is named and cannot be read,
+refuses to start. A send that fails is logged by what failed — the key file,
+the service unreachable, the status it answered — never the address or the
+link.
+
+`test/account-links.test.js` and `test/account-links-output.test.js` hold
+each of these, against a stand-in for the email service; `npm run
+account-links-fail-control` breaks each one in turn.
+
+### Passkeys for the admin
+
+**A passkey is optional**, and the password stays: a passkey is a second way in,
+never the only one. The admin adds, names, lists and removes their own, behind
+their session (WebAuthn, through `@simplewebauthn/server`; migration 0047):
+
+    POST   /api/v1/auth/passkeys/options     [{password}]  ->  200 {challenge_id, options}  (the creation options)
+    POST   /api/v1/auth/passkeys             {challenge_id, name, response}  ->  201 {passkey: {id, name, created_at, last_used_at, disabled_at}}
+    GET    /api/v1/auth/passkeys             ->  200 {passkeys: [...]}
+    POST   /api/v1/auth/passkeys/rename      {id, name}        ->  200 {passkey}
+    POST   /api/v1/auth/passkeys/remove      {id}              ->  204
+    POST   /api/v1/auth/passkey/options      ->  200 {challenge_id, options}  (no session needed)
+    POST   /api/v1/auth/passkey/sign-in      {challenge_id, response}  ->  200 as sign-in answers, and the cookie
+
+`options` is the WebAuthn options JSON, binary fields base64url; `response` is the
+browser's answer in the same form (`PublicKeyCredential.toJSON()`).
+
+**One relying party.** `PASSKEY_RP_ID` is a domain, and it must be the host of
+every origin in `PASSKEY_ORIGINS` or a domain above it (`example.com` for
+`https://admin.example.com`); `serve` refuses any other. So one passkey works on
+every site of the deployment that shares that domain. `PASSKEY_ORIGINS` is a
+comma-separated list of origins, `ADMIN_ORIGIN` when unset. With no
+`PASSKEY_RP_ID`, passkeys are off and every passkey route answers `409
+passkeys_not_configured`.
+
+**The person is verified, not only present.** Adding a passkey and signing in
+with one ask for user verification (`userVerification: "required"`: Face ID, a
+fingerprint, the device's PIN), and a response without it is refused: a security
+key with no PIN, which anyone holding it can press, is neither added nor let in.
+
+**Adding one is proved again.** The cookie alone does not add a passkey: the
+session must have signed in with the password within the last five minutes, or
+`/passkeys/options` must carry the password, `{"password"}`. Otherwise it answers
+`403 password_required` ("Enter your password to add a passkey."). A session that
+signed in with a passkey has proved no password. The password is checked as
+sign-in checks it: a place in the hash line, the address's lock, and a wrong one
+counted toward that lock; a wrong password and a locked address are one answer,
+`403 password_not_accepted`, at sign-in's floor. **The account holder is told by
+email** that a passkey was added, its name and when, after the answer; with no
+email configured, the log says the notice was not sent (never to whom), and the
+change log has the line either way.
+
+**A challenge works once**, for five minutes, for its own purpose. Challenges are
+kept in the database (`passkey_challenges`), so every process of a deployment and
+a restart see the same ones, and each is taken with one `DELETE`, so two uses at
+once find it once. Adding a passkey's challenge is bound to the admin and the
+session that asked, by a SHA-256 of them. One caller address holds at most 20 at
+once (`429 passkeys_busy` past that); ended ones are purged as new ones are made.
+
+**A passkey's counter must go up** with every use (or stay 0 on an authenticator
+that keeps none). It is read only after the signature has checked: one that did
+not go up means a copy of the key is in use, so the sign-in is refused, `401
+passkey_refused`, and the admin's passkey is **turned off** (`disabled_at`, listed
+with it) in the same transaction, with a line in the change log
+(`passkey.turn_off`, by nobody, its name and never its key) and one in the log
+(which passkey and tenant, never a key, a counter or a response). A passkey that
+is turned off is never found again; the admin removes it and adds another. Two
+sign-ins at once with one counter: one is let in, the other turns the key off. A
+linked person's passkey is the module's to turn off: a counter that did not go up
+is refused here before the module is told, and logged.
+
+A passkey sign-in keeps sign-in's floor, its per-address attempt limit and its
+`Origin` rule. Its refusals are one: an unknown passkey, a signature that does not
+check, a response without user verification and a copied key answer the same.
+**A password reset removes every passkey of the admin** -- by the emailed link
+and by `reset-admin-password` -- in the reset's own transaction, and the admin is
+told by email how many went; a passkey added before the password last changed is
+not found in any case, whatever changed it. A passkey whose admin is removed goes
+with them. Adding, renaming and removing one is a line in the change log
+(`passkey.add`, `passkey.rename`, `passkey.remove`), with its name, never its key.
+
+### Linked accounts: people beside the admin
+
+The admin is the only account this repository keeps. **A deployment may link a
+module that keeps other people** — managers, people who look after the money,
+people who look after one garage — and this platform asks it who they are,
+exactly as it asks a validations module about a validation: through a door the
+deployment names, never by importing anything of it.
+
+**`ACCOUNTS_DOOR` names it**, a bare command name found in `ENTITLEMENT_BIN_DIR`
+or on the PATH, and **there is no default. Unset means only the one admin**,
+exactly as before: no door is ever run, and a sign-in for any other email is
+refused as an unknown email is. The module's own database address is the
+module's, in the environment it is given; a password goes to it on **stdin,
+never argv**. It answers JSON on stdout, and **its exit status is the answer**:
+
+    <door> sign-in                              < {"email", "password"}
+        0  {"person", "tenant", "email", "name", "language", "garages": "all" | [ids],
+            "permissions": [...], "version"}
+        1  {"refused": true}      no such person, a wrong password, or nobody the dashboard is for
+    <door> who --tenant T --person P
+        0  the same as sign-in    1  {"gone": true}
+    <door> passkey --credential C
+        0  {"person", "tenant", "public_key", "counter", "transports"}    1  {"unknown": true}
+    <door> passkey-used --credential C --counter N
+        0  {"counter": N}         1  {"refused": true}   (the counter did not go up)
+    2  could not decide: words on stderr, nothing to read on stdout
+
+`version` changes whenever the person's garages, permissions or password change.
+Anything but these shapes, a door that cannot be run or does not answer within
+15 seconds, and exit 2 are all **could not decide**: the sign-in is refused, `503
+sign_in_undecided` ("Sign-in could not be checked just now. Try again in a
+moment."), and **nobody is let in**.
+
+**Sign-in asks the admin first.** An email that is not the admin's, with the door
+named, goes to the door; the door's refusal is the same `401 sign_in_refused`,
+byte for byte. **And in the same time**: the admin's password is checked here and
+anyone else's by the module, a slower road, so with the door named every sign-in
+refusal -- the admin's too -- waits for `ACCOUNTS_SIGN_IN_FLOOR_MS` (default 2000,
+200 to 15000) or sign-in's own floor, whichever is larger. Set it above the
+module's own time: a door sign-in that takes longer is logged ("the accounts door
+took N ms ... raise it"), since its road would then be on the wire. A module that
+cannot decide (`503`) is answered at the same floor. **The per-address lock covers door
+sign-ins**: ten refusals for one email from one address lock that address out of
+that email for 30 minutes, kept by a hash of the email (`linked_sign_in_locks`),
+and a locked address does not reach the door. A permission the door names that
+is not in the list below, a garage that is not an id, or a tenant this platform
+does not have, is could-not-decide, never a smaller session.
+
+**The session keeps** who, the tenant, the garages, the permissions and the
+version (`linked_sessions`; only the token's SHA-256), under sign-in's own idle
+and absolute ends and the same cookie. **It asks `who` again** when the last
+answer is older than `ACCOUNTS_RECHECK_SECONDS` (default 60, 10 to 900): a new
+version takes the new garages and permissions; `gone`, or another tenant, ends
+the session (`401 session_ended`); could-not-decide refuses the request, `503
+accounts_undecided`, and runs nothing, until the door answers again. A linked
+person's passkey is the module's: the passkey sign-in above asks `passkey` for an
+id this platform does not keep, checks the signature here, and records the use
+through `passkey-used` before it asks `who` and signs in.
+
+A linked person's change-log lines name them by the email the module gave
+(`actor_kind` `linked`). Their language comes from the module; `PUT
+/api/v1/auth/language` changes it for that session only.
+
+### Permissions: one on every operator route
+
+**Every operator route names exactly one permission**, and a request whose
+session does not hold it is refused `403 permission_refused` before the route
+runs. The list is this platform's own, each a `read` or a `change` (`change`
+includes `read`):
+
+    garages   the garages, their setup, alerts, the board, banned cars
+    rates     rate plans, taxes, the board's prices
+    lanes     lanes, their computers, closing and reopening
+    payments  the garage's own Stripe account, its location and card readers
+    money     takings and the reconciliation
+    refunds   giving money back
+    payouts   the payouts view
+    account   the account itself, its keys
+    inventory walks through a garage and what they saw
+    stays     open and past stays, the stuck list, ending a stuck one; the cars at an
+              exit, letting one out, paying at a phone reader; the exceptions
+    log       the change log and refused attempts
+
+**The admin and every operator key hold all of them**, at every garage, so
+nothing an admin or a key does today changes. A linked person holds what the
+module says. **A route about a garage** — its id in the path, or a lane or a
+computer of it — **also checks that garage is in the session's list**, and one
+that is not answers what an id naming nothing answers (`404`), so a list never
+says what lies outside it. **The account's own change-log lines** -- those of no
+one garage: its passkeys, its keys, its admin's language -- **are read only by a
+session over every garage**; a person at some garages reads their garages' lines
+and refused attempts, and the count of them, without the account's. `GET /api/v1/garages` lists only the session's
+garages; making a garage needs `garages:change` and every garage. A test walks
+every route the operator router has and fails if one names no permission, or
+one that is not in the list.
+
+`GET /api/v1/auth/me` says who: `{kind: "admin" | "linked", email, name,
+tenant_id, session_ends_at, language, permissions, garages: "all" | [ids]}`.
+
+### Done by
+
+**An operator key may say who, in plain words, is acting through it**: an
+`X-Done-By` header, the person's name percent-encoded as UTF-8, 1 to 80
+characters after it is decoded, with no control characters (`400 done_by_refused`
+otherwise). It is kept on the change-log line of what the request changes, and
+read back with it (`done_by`). **It is never trusted for anything else**: the
+key's permissions are the key's, whatever name is given, and on a session the
+header is not read: the line names the person signed in.
+
+`test/linked-accounts.test.js`, `test/passkeys.test.js` and
+`test/permissions.test.js` hold each of these, against a stand-in for the door
+(`test/fixtures/accounts-door`); `npm run linked-accounts-fail-control` breaks
+each one in turn.
+
+### The owner's reads
+
+What the owner's screens read, behind the session or a key, tenant-scoped in
+each query as well as by row-level security; another tenant's garage is `404`.
+
+    GET /api/v1/garages                     {garages: [{id, name, timezone, currency, live}]}
+    GET /api/v1/garages/<id>                {garage: {id, name, timezone, currency, live}}
+    GET /api/v1/garages/<id>/lanes          {quiet_minutes, lanes: [{id, name, direction,
+                                                      devices: [{id, name, last_seen_at, revoked_at}],
+                                                      reader: {reader_id, label, bound_at} | null}]}
+
+`live` is whether the garage is activated. A revoked device is listed with its
+`revoked_at`, as the devices route lists it; a reader is the one bound now. No
+credential hash is ever in an answer. `npm run garage-reads-fail-control`
+breaks each property in turn.
+
+### A garage's past stays
+
+    GET /api/v1/garages/<id>/stays/closed?from=<instant>&to=<instant>[&limit=<n>][&after=<next>]
+        {garage_id, from, to, limit, next,
+         stays: [{entry_at, exit_at, fee_minor, subtotal_minor, currency, exit_outcome, pricing_refused,
+                  occupancy_at_entry_bp, ended}]}
+
+The garage's own history: the stays that **closed** in `[from, to)`, oldest exit
+first, a page at a time (`next` is the `after` for the following page, `null`
+on the last). Read-only; it writes and corrects nothing. **No vehicle identity**
+is in it — no plate, ticket, descriptor, picture, vehicle id or stay id. `from`
+and `to` are instants with their offset; the garage's time zone is on the
+garage, and the reader buckets by local day. The range is at most 93 days and a
+page at most 5000 stays (1000 when `limit` is not given); outside either bound,
+or with a cursor that is not one this route gave, it is refused `400` with a
+code (`range_invalid`, `range_too_long`, `page_size_invalid`, `cursor_invalid`).
+`exit_outcome` is null on a stay priced by the old hourly rate (0015);
+`fee_minor` is null on a covered stay and on one whose pricing was refused
+(`pricing_refused`), which is not a stay that paid nothing.
+`test/past-stays.test.js` holds each; `npm run past-stays-fail-control` breaks
+each in turn.
+
+### Making a garage
+
+    POST /api/v1/garages   {name, timezone, currency, default_action?, space_class?, transient_available?}   201 {garage}
+
+A garage's time zone, money and name are frozen onto its stays and its money,
+so each is checked before anything is stored, and each refusal is one plain
+sentence with its own code, never a bare 500: a **time zone** the database
+does not know (`pg_timezone_names`, spelled as it spells it) is refused `400
+garage_timezone_refused`; a **currency** that is not a code in use today
+(ISO 4217, less funds, metals and test codes — `src/currencies.js`, the list
+the admin screen offers) or not in capitals (`usd`) is refused `400
+garage_currency_refused`; a **name** that is not text, is only spaces, or is
+longer than the column allows (100 characters, migration 0032) is refused `400
+garage_name_refused`. `test/garage-checks.test.js` holds each;
+`npm run garage-checks-fail-control` breaks each in turn.
+
+### Setup: the checklist, lane setup and closing, and the change log
+
+    GET    /api/v1/garages/<id>/setup     {setup: {garage_id, open, takes_any_driver, steps: [{key, done, facts}]}}
+    PATCH  /api/v1/lanes/<id>             {name}                         rename
+    DELETE /api/v1/lanes/<id>                                            only a lane never used; takes its screen messages with it
+    POST   /api/v1/lanes/<id>/close       {reason, message, override?}   full | everyone
+    POST   /api/v1/lanes/<id>/reopen
+    GET    /api/v1/garages/<id>/changes[/<line id>]           {changes: [...], next}            the changes made, newest first, 50 a page
+    GET    /api/v1/garages/<id>/refused-attempts[/<line id>]  {refused: [...], next, count}     refused attempts, apart; count = {lines, attempts}
+
+**The checklist** is worked out in one place, `src/setup.js`, from the reads
+that already exist -- the activation readout, the recorded payment account, the
+lanes with their computers and readers -- and nothing is ticked by hand. Steps,
+in order: `garage_details`, `drivers`, `lanes` (a way in and a way out),
+`lane_computers`, `rates`, `taxes`, `getting_paid` and `card_readers` (only for
+a garage that takes any driver), `alerts` (every alert has someone to tell,
+below), `open` (and what is still missing). A lane
+computer counts as connected when it was heard from within
+`LANE_QUIET_MINUTES` minutes: a start setting (5 unless the deployment sets
+it), declared once in `src/startSettings.js`. It is the platform's one verdict
+on a quiet lane: the setup read and the lanes read (`quiet_minutes`) return
+the value they used, and the admin reads it from them and keeps no copy. The
+devices route below still publishes the timestamp alone.
+
+**A lane** is renamed, or removed only if it never had a stay, a computer, a
+card reader or an event (`409 lane_has_history`, with what it has in
+`details`). It is **closed by hand** with a reason -- `full` (pass and monthly
+holders still get in) or `everyone` -- and the owner's message, and who closed
+it and when are kept on it; reopening keeps the same (0026). Closing the last
+open lane of a direction is `409 last_open_lane` unless the request says
+`override: true`. A closing locks every lane of the garage, in one order, by
+id, before it reads any of them, so two closings at once queue rather than
+deadlock, and the second sees the first; connecting a computer holds its lane
+(`FOR KEY SHARE`), so a removal at the same moment either refuses it or comes
+second (`test/races.test.js`). `/lane/rules` and the fast `/lane/stays` both
+carry the lane's state and message, and the lane acts on it. `full` is
+a way in's reason only and is refused on a way out by name
+(`400 lane_reason_refused`; 0030 holds the same in the database).
+
+**Text for a lane's screen** -- a closed lane's message, or a board message --
+is 1 to 160 characters, and every character must be one the screen can draw
+once upper-cased: the screen's font is upper case only, `A`-`Z`, `0`-`9`, the
+Spanish accented capitals and `` .,-:'!?/+`` and space. A character outside it
+is refused naming each one (`details.characters`), never shown as a gap. The
+list is `src/screen-characters.json`, a copy of gate-agent's
+`src/gate_agent/font.py` at the commit the file names;
+`npm run check-screen-characters` reads that font at that commit and requires
+the same set (in CI, with a self-test that plants one character on each
+side). `GET /api/v1/garages/<id>/lanes` and `.../board` serve the list as
+`screen: {characters, message_max}`.
+
+**The board** (0030): what a lane's screen shows while no ticket or fee is up
+and the lane is open -- the owner's messages, one after another, and the
+price where the owner switches it on. Nobody types a price: the lane works it
+out with the engine and the taxes it charges with.
+
+    GET    /api/v1/garages/<id>/board                                          {timezone, messages_max, messages, lanes, screen}
+    POST   /api/v1/garages/<id>/board-messages        {text, lanes: [laneId], starts?, ends?}   201 {message}
+    PATCH  /api/v1/garages/<id>/board-messages/<id>   {text?, lanes?, starts?, ends?}           {message}
+    DELETE /api/v1/garages/<id>/board-messages/<id>                                              204
+    PUT    /api/v1/lanes/<id>/board-prices            {show: true | false}                      {lane: {id, prices}}
+
+`starts` and `ends` are optional, written in the garage's own time as
+`YYYY-MM-DDTHH:MM` and kept as instants turned with the garage's timezone; an
+end not after the start, or already past, is refused. At most 20 messages a
+garage. A message is on at least one lane, always: a change to no lanes is
+refused by name, removing a lane takes it off every message and removes a
+message left on no lane in the same transaction (its change-log line names
+both, `messages_off` and `messages_removed`), and the database refuses a
+commit that would leave a message on no lane, whoever writes it. Each lane's `/lane/rules` and `/lane/stays` carry
+`board: {prices, messages: [{id, text, starts_at, ends_at}]}` -- that lane's
+messages that have not ended, oldest first -- and the lane decides by its own
+clock which are in force, so an event's message goes up and comes down on
+time with the network down. `npm run board-fail-control` breaks each property
+in turn.
+
+**The change log** (`garage_changes`, 0026). Every operator write route --
+`WRITE_ROUTES` in `src/app.js`, 30, checked against the router -- and the
+owner's language write one line each, in the same transaction as the change:
+who (the signed-in owner by email, or the key by its name), what, before and
+after, when. A request that changed nothing -- the same before and after --
+writes no line, on every route. A refused write is a line too, through
+`record_refused_change()` (0028). With a sign-in or key that works NOW, it goes
+in the log of the account whose garage, lane, computer or key the path names
+(someone from another account is never named there, and a "not found" says
+what was not found: `garage_not_found`) and, when that is not the caller's own,
+in the caller's account's log too; a key is named by its name. With this
+account's own sign-in or key that no longer works -- a cancelled or expired
+key used again, which may be a stolen one, or an ended sign-in replayed -- it
+goes in THIS account's log only, never another's, naming the key or the owner
+and why (`key_cancelled`, `key_expired`, `session_ended`). With no credential,
+or one that is no account's, it goes only to `platform_security_log`, whatever
+it names: the owner can do nothing about it, and it is the easiest thing to
+send in bulk. That log no owner reads and the
+application holds no grant on. The bound is per source -- the caller's account
+and person or key, or, for nobody, the address (kept only as a hash): one
+source gets 20 refused lines a minute in a log, across every route and id; the
+same attempt again is counted on its line (`attempts`, `last_at`), and beyond
+the 20 one more line, `too_many_refused`, carries the count of the rest. So
+hammering any route, with any ids, cannot fill a log, and the changes made are
+read apart from the refused attempts (`/refused-attempts`), so no number of
+them can push a change off the owner's page. Behind a proxy, `TRUST_PROXY`
+must be set, or every unsigned caller is one source (see "Deploying"). Changes that were made
+are never counted together. A malformed id is refused
+before the database, as before, and writes no line. The log is append-only:
+the application may `SELECT` and `INSERT`, and a trigger refuses `UPDATE`,
+`DELETE` and `TRUNCATE` for every role, the table's owner included. No line
+holds a password, key, lane computer code, cookie or session value: a line is
+built from named fields, and `src/changes.js` refuses one that holds a
+credential. `npm run setup-fail-control` breaks each property in turn.
+
+### Pictures, tailgaters and banned cars (0033)
+
+His answers, 2026-10-11: pictures at the closing loop and between the vend and it, kept one week after the car
+leaves (30 days since 2026-10-26, below); a tailgater whose identity is read is a stay like any other and pays at the exit; banning tailgaters is
+the owner's choice in the location setup, off until they turn it on, and so is whether the list covers this
+garage or all their garages; a ban lasts until someone takes the car off; no car is put on the list by hand.
+
+- **Pictures** (`entry_pictures`) are kept against the lane's event id of the entry record: a stay's open, a
+  crossing no car made, a banned car refused. Since 0036 a stay's pictures include the arming read's, the
+  ones its car was identified from. They are removed **30 days** after they were taken (the owner's answer
+  of 2026-10-26; it was one week), by the picture job, *Picture retention* below. A car still inside keeps
+  its pictures, then for 30 days after it left, and for as long as its customer has paid picture storage; a
+  car on the list keeps them.
+- **A tailgater stay** is opened with `tailgater: true` and prices at the exit as any other: a car no vend let
+  in whose plate was READ. Since 0036 the lane opens a stay for every car through the gate that no open command
+  let in, read or not, and marks it `no_open_command: true` -- its own field: a car nobody could read is a stay
+  (`plate_unreadable`, *A stay is identified...*) with `no_open_command` and never `tailgater`.
+- **Two settings** on `PATCH /garages/:id`, off by default: `ban_tailgaters` (true or false) and `ban_reach`
+  (`garage` or `all`).
+- **The list** (`banned_vehicles`): with `ban_tailgaters` on, a tailgater stay opened with a `descriptor` and
+  a READ plate is listed -- never a car nobody could read, whatever its open says (0036): a monthly with a dirty
+  plate through a raised barrier would otherwise be refused at every entry on a match nobody can check. Nothing
+  else lists a car. A ban reaches its own garage, or every garage of the account when the garage
+  it was listed at says `all`. Each lane gets the bans that reach it on `GET /lane/rules` as `banned:
+  [{id, descriptor}]`, and refuses a car whose descriptor matches one.
+- **While listed**, the car's vehicle is not redacted and its pictures are not removed. Taken off, both follow
+  the normal rules.
+
+| | |
+|---|---|
+| `GET /garages/:id/banned` | the two settings and every car whose ban reaches this garage, each with its pictures |
+| `POST /garages/:id/banned/:banId/remove` | takes a car off the list; one change-log line, `garage.banned_car_remove` |
+| `GET /garages/:id/banned/:banId/pictures/:pictureId` | one picture, as the image, `no-store` |
+
+### Alerts: who gets which alert, and how
+
+    GET    /api/v1/garages/<id>/alerts                         {alerts: [{key, needs}], quiet_minutes, max_contacts, sending, contacts: [...]}
+    POST   /api/v1/garages/<id>/alert-contacts                 {name, phone?, email?, language?}   201 {contact}
+    PATCH  /api/v1/garages/<id>/alert-contacts/<id>            {name?, phone?, email?, language?}  {contact, turned_off}
+    DELETE /api/v1/garages/<id>/alert-contacts/<id>                                                204
+    PUT    /api/v1/garages/<id>/alert-contacts/<id>/choices    {by_text: [alert], by_email: [alert]}  {contact}
+
+Per garage, the people to tell when something goes wrong (`alert_contacts`,
+0029): a name, a phone number and/or an email address, and a language (`en`
+unless said). They have no account and never sign in. **The alerts** are one
+list, `ALERTS` in `src/alerts.js`, in order: `lane_problem`,
+`lane_not_answering` (its description needs `quiet_minutes`, the quiet setting
+above, read from the platform), `garage_not_answering`,
+`card_payments_stopped`, `attendant_link_dropped`. Adding one is one entry
+there. For each alert, each person gets it by text, by email, both or neither.
+
+**Nothing is sent** in this round: no provider, no key, no network call
+(`sending: false`). Sending is the alert module's. Until it lands nobody is
+`confirmed`, and 0029 holds that false: before the first alert goes to a
+person, they will be asked to confirm.
+
+**A phone number** is kept as `+` and 8 to 15 digits: a US number of 10
+digits, or 11 starting with 1, as `+1` and the 10; any other must start with
+`+`. Spaces, dashes, dots and brackets between the digits are dropped; letters,
+invisible characters and anything else are refused, `400
+alert_contact_phone_refused`, with the reason in `details.reason` and never the
+number. **An email address** is trimmed, has one `@` with something either
+side, no space or invisible character, and at most 254 characters, or `400
+alert_contact_email_refused`. A person needs one or both
+(`alert_contact_unreachable`). A text choice needs a phone and an email choice
+an address (`409 alert_text_needs_phone`, `alert_email_needs_email`); taking a
+phone or address away turns the choices that needed it off in the same change,
+and the answer's `turned_off` and the line say which. At most 25 people a
+garage (`409 alert_contacts_full`) and a name of 1 to 80 characters with no
+invisible characters (`alert_contact_name_refused`, `details.reason`). What a
+name holds is the owner's. The database holds every one of these rules too,
+whoever writes the row -- and a person's garage is one of their own account's,
+which a foreign key alone would not hold (it is checked without row-level
+security).
+
+**Nothing typed about a person enters a log.** A line about a person holds
+their id and what kind of change it was -- `name: changed`, `phone: given ->
+changed`, `by_text: [card_payments_stopped]` -- never their name, number,
+address or any other typed value: `src/changes.js` refuses a line about a
+person that holds a name or any word but the platform's own (`LINE_WORDS` in
+`src/alerts.js`), and 0029 refuses a name on one (`garage_changes_person_unnamed`).
+**The name is read when the log is read**: the change log names each person as
+they are named now, and a person who has been removed as removed
+(`subject.removed`, with no name) -- so removing a person takes their name out
+of every line, page and file. A refused attempt on a person names the route
+(`PATCH /api/v1/garages/:garageId/alert-contacts/:contactId`), never the path as
+it was sent. No line holds a value the write handed the guard as private
+either, compared as digits only too. A database refusal is passed on without
+its detail, which would quote the row. The garage and the person come from the
+session and the path only. The checklist's `alerts` step is done when every
+alert has at least one person; it never holds opening back.
+`npm run alerts-fail-control` breaks each property in turn (28).
+
+### A lane that has gone quiet
+
+`GET /api/v1/garages/<id>/devices` lists the devices on that garage's lanes with
+`last_seen_at` — the column written on every authenticated lane request. It is
+the only place anything can see that a lane has stopped reporting, because a
+lane that is switched off cannot report that it is switched off.
+
+This route publishes the timestamp and **no verdict**. How long is too long is a
+per-site assumption: the one place it is set is `LANE_QUIET_MINUTES`, which the
+deployment declares, and only the setup and lanes reads apply it. `revoked_at` is in the listing beside it, because a
+revoked device that stops being seen is not a fault. `token_hash` is not.
+
+### Every conflict names itself
+
+A `409` is this platform's **terminal** refusal: a lane classifies `5xx` as
+retryable and re-sends forever, so anything meant as final arrives as one of
+these and the lane dead-letters it. Seven different conditions produced one
+indistinguishable fact, and one of the seven is a clock skew large enough that
+every session open and close from that lane is being dropped — money leaving the
+record, reported to nobody.
+
+Every `409` body therefore carries a machine-readable `code` beside the human
+`error` message:
+
+```json
+{ "error": "entry_at is 600s ahead of this server's clock, more than the 120s of drift tolerated — a time in the future is not a stay that has happened", "code": "clock_skew" }
+```
+
+It is on **all** of them and not only on the skew, because a code present on one
+refusal and absent from six cannot distinguish "this was not a skew" from "this
+platform is too old to say". A consumer reading that absence as "not a skew"
+would report a healthy clock while the record lost every session the lane sent.
+
+### Rate plans: the plan store
+
+Pricing lives in [`rate-engine`](https://github.com/openparking-ai-code/rate-engine),
+a finished engine with **no persistence**: `quote(plans, stay)` takes every plan
+version of a garage on every call and picks the one in force at entry. Until
+migration 0012 nothing in this platform could hand it that list — `rates` is an
+hourly figure with no currency, no plan, no version and no effective date — so
+the platform is the engine's first caller, and this is the store.
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
+  -d '{"plan": { ...the plan document, whole... }, "confirmed": true, "based_on": null}' \
+  http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # 201, the row and the document
+curl -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans     # every plan of the garage, and the space class its stays are priced as
+```
+
+What the store does, and does not do — the reasons are in `migrations/0012_rate_plans.sql`:
+
+- **The document is stored whole.** The engine's own loader refuses and names any
+  key its version does not understand; a schema that shredded the document into
+  columns would drop exactly those keys silently. `plan_version` and
+  `effective_from` are lifted out as index keys and CHECKed against the document.
+- **Validated by the engine before it is stored, never at the barrier.** The route
+  sends the document to the engine's `POST /v1/validate-plan` at `RATE_ENGINE_URL`.
+  A document the engine cannot load is a `400` carrying the engine's sentence
+  (which names the key). A document that loads but has **findings** — a gap
+  nothing prices, a conflict — is `409 plan_has_findings` with every finding in
+  `details`, settled ones included: a decision is an acknowledgement, not a
+  price. No engine reachable is `409 rate_engine_unavailable`, never a silent
+  accept.
+- **The read returns every plan; the engine selects.** There is no "current plan"
+  route and no selector here. The engine's `select_plan` picks by entry time and
+  its own test holds that rule; a second chooser would be the copy that drifts.
+- **Currency is the garage's, in one place.** The document restates it; a plan in
+  another currency is `409 plan_currency_disagrees_with_garage` at the route and
+  a trigger refusal on a direct INSERT.
+- **One version name and one effective instant per garage** —
+  `409 plan_version_exists`, `409 plan_effective_from_taken`. Two versions at one
+  instant is the ambiguity the engine refuses on every stay from then on; it is
+  refused here first.
+- **The owner confirms, every time.** The body carries `"confirmed": true`
+  or it is `400 not_confirmed`, before the engine is asked: nothing is saved
+  until somebody has checked the prices and said so. The admin asks for it with
+  a tick and a Confirm button, after showing the prices the plan charges; a key
+  sends it too. The change-log line says `confirmed: true`, and its own actor and
+  time say who confirmed and when.
+- **A plan never starts in the past.** An `effective_from` more than 60 s
+  before this server's clock is `409 plan_starts_in_the_past`. Measured before
+  it was built: a plan dated one hour back was stored and priced a car that came
+  in half an hour earlier — 2.50 became 10.00. The engine prices on the plan in
+  force at entry, so "a rate change never reaches back into a car that is
+  already parked" holds only while every plan starts after it is saved. The
+  60 s are for the owner's screen and this server reading two clocks.
+- **Nothing is scheduled: a plan starts when it is saved.** An
+  `effective_from` more than the same 60 s after this server's clock is
+  `422 rates_start_when_saved`. A plan waiting for a later date would take over
+  on its day with no screen showing it; a save is charged to cars that come in
+  from the moment it is confirmed, and a car already parked keeps the plan it
+  came in under.
+- **The rates checked are still the newest.** The body carries
+  `"based_on"`: the id of the plan in force when the owner's prices were worked
+  out (`null` for a garage with none). Any other plan stored since — another
+  owner saving while this one was checking — is `409 rates_changed_since_check`
+  and nothing is stored. Decided in the transaction that inserts, behind a lock
+  held per garage, so two saves on the same rates cannot both pass.
+- **Append-only by grant, like `events`.** A changed price is a new version.
+  Storing one is recorded as a `rate_plan_stored` event naming the operator token.
+- **A closed stay keeps `plan_version`, `breakdown` and `space_class` beside
+  `fee_minor`** — the version that priced it, the engine's plain-English ledger
+  and the class it was priced as, together or not at all.
+
+### Try a stay: the close's pricing, nothing stored
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
+  -d '{"plan": { ...a draft, optional... }, "stays": [{"entry": "2026-10-14T08:30", "exit": "2026-10-14T17:45"}]}' \
+  http://127.0.0.1:3000/api/v1/garages/<id>/rate-plans/try
+```
+
+What a car would pay, before the owner saves anything. `stays` is 1 to 100
+`{ entry, exit }`, each a date and time **in the garage's own time**
+(`YYYY-MM-DDTHH:MM`); a time the clocks skip is refused by name, and a time that
+happens twice is the first of the two. Without `plan` the garage's stored plans
+price them; with `plan`, the stored plans **and** the draft, exactly as the
+close will see them once it is saved — a car that came in before the draft
+starts is priced by the plan it would really get.
+
+- **The close's own path.** Each stay goes through `priceStay`, then
+  `taxedPricing` with the tax taken at the exit, the two functions the close
+  calls. A test prices 50 stays this way, stores the draft, closes all 50
+  through the lane routes and requires every fee and every line to be the same.
+- **Each answer**: the stay in the garage's time and as instants, its minutes,
+  the plan and the special that priced it, the discounts or increases applied,
+  the rate lines, the tax lines, the subtotal and what the driver pays — or
+  `refused: true` with the engine's findings. A garage whose taxes are not
+  stated for that moment yet (rates come before taxes on the checklist) is
+  answered without tax and `taxes_stated: false`.
+- **Nothing is stored.** A read-only transaction: no plan, no event, no
+  change-log line, done or refused — it is the one operator POST that is not a
+  write (`READ_POSTS`).
+- **The store's own refusals.** A draft the engine cannot load is the store's
+  `400`; one the store would refuse for this garage is the store's `409`
+  (currency, space class, a version name or a start already used). A draft with
+  findings is still tried: they come back in `draft_findings`, and the stays
+  they touch come back refused. Another account's garage is `404`; nothing
+  stored and no draft is `409 no_rate_plan`; more than 20 tries a minute from
+  one owner or key is `429 too_many_tries`.
+
+`npm run rates-and-open-fail-control` breaks each property in turn — the
+try's tax taken its own way, a try that writes, the limit, the draft priced
+alone, a plan dated back, the confirmation ignored, one opening step dropped,
+alerts made required — and requires the test that names it to go red.
+
+### The close prices through the engine, and a close that cannot price still closes
+
+`src/fees.js` is gone (migration 0013). `POST /lane/sessions/close` hands
+**every** plan of the garage — unfiltered — with the garage's currency and
+space class to the engine's `POST /v1/quote`, and freezes what comes back onto
+the stay. The engine picks the version in force at **entry**; its own test holds
+that rule, and this platform does not pre-select, because a platform that handed
+it one version would have made the choice itself, silently, by exit time. The
+response is the row, never a recomputation, and a replay echoes what was
+frozen. A later version never reprices a closed stay.
+
+**A refusal is not a refusal of the close.** `computeFee` could not fail;
+`quote()` refuses by design — no version in force at entry (the ordinary first
+morning of a plan: cars that came in the night before), a gap the plan set left
+— and a `409` there is **dropped by the lane**: the barrier has already
+opened, the car is gone, the stay never closes, nothing is billed, and the car
+is counted inside for ever. So the stay closes **unpriced**: `200`,
+`fee_minor: null`, the refusal — the engine's findings, verbatim — in
+`pricing_refusal`, a `close_unpriced` event beside it, and a line under
+`closes_unpriced` in the reconciliation report (codes, no plate). A flag for a
+human, not a hole in the ledger; the same principle as `exit_held`.
+
+An engine that **cannot be reached** is different and is not recorded as
+unpriced: the stay can be priced, just not now. That close answers `500`, the
+transaction rolls back, and the lane's outbox retries with the same event id.
+
+**A space class, because the engine prices a space.** A garage carries
+`space_class` (default `standard`, set at creation, frozen like its currency);
+every stay in it is priced as that class, and the store refuses a plan that
+does not declare it (`409 plan_does_not_price_garage_space_class`). A garage
+with two kinds of space is not expressible today — stated, not hidden.
+
+`test/pricing.test.js` drives all of it through the lane route against the real
+engine. `npm run pricing-fail-control` breaks each property — the 409 put back,
+the refusal uncaught, an outage recorded as a refusal, the platform selecting
+the latest version, the class hard-coded, the ledger dropped, the event
+dropped, the report hiding the row, the store ignoring the class, and two
+schema statements never created — and requires the suite to go red.
+
+`test/rate-plans.test.js` starts the real engine — the commit in
+`rate-engine.pin`, installed by CI — because the store's claims are the engine's
+sentences and a stand-in would test this platform against itself.
+`npm run rate-plans-fail-control` breaks each property in turn and requires the
+suite to go red.
+
+### The activation gate
+
+**A garage opens only when its whole setup is done**: every step of the
+setup checklist except alerts — the garage's details, the drivers answer, a way
+in and a way out, every lane computer heard from, a rate plan in force, taxes
+stated, and, for a garage that takes any driver, a payment account that can
+take cards and a card reader on every way out. A pass-only garage has no
+getting-paid or card-reader step. Alerts never hold opening back. The list is
+worked out **once**, by `openingSteps` in `src/setup.js`: the setup read shows
+it as the open step's `not_done`, and `POST .../activate` refuses on it,
+`409 garage_not_activatable` with the steps in `details.unmet`.
+
+The database re-checks the three conditions it can see as the row is written
+(migrations 0014 and 0022), and `GET .../activation` reads them:
+
+- **rate_setup_complete** — at least one plan is stored and a version is in
+  force now. The store already refused a plan the engine found fault with, so
+  this is presence and coverage, not a second validation.
+- **transient_mode_stated** — `transient_available` is `true` (sells transient
+  parking) or `false` (pass and monthly only). It is the three-state field
+  `garage-pass` ships, copied: unstated (`null`) is not false, nothing defaults
+  it, and a request cannot send `null` as a value. Stated at creation or by
+  `PATCH /api/v1/garages/<id>` at any time; restatable, never un-statable.
+- **taxes_stated** — a tax set is in force now: with rules, or stating that the
+  garage charges none. The same three states and the same rule — with rules,
+  none, or **unstated** — and no set in force is unstated, never "none". See
+  *A garage's taxes* below.
+
+The payment condition is the setup's getting-paid step: the account this
+platform **recorded** for the garage can take cards. Activation's own module
+and its migrations still name no payment processor, and a test sweeps them.
+What the owner also asked for — money collection **tested** — is not a
+condition yet, because nothing in the system tests a payment yet; a gate never
+reports satisfied what it cannot observe.
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/activation   # active?, and each condition with why not
+curl -X POST -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/activate     # 201 and a garage_activated event, or 409 garage_not_activatable with the setup steps not done in `details.unmet`
+```
+
+Activation is an act, with a timestamp and the operator token that did it, and
+the database's own trigger checks the same conditions as the row is written —
+a direct `UPDATE` does not go around the route. Once set it cannot be cleared
+or moved. **An inactive garage does not operate:** `POST /lane/sessions/open`
+and `/close` answer `409 garage_not_active`, and because the lane drops a 409,
+the refusal is **recorded first** as a `garage_inactive_refusal` event keyed on
+the lane's event id. `/lane/rules` carries `active` so a lane can see it.
+
+What the gate does not reach: a stay that outlived the plan that covered it. It
+still arrives at the exit with no price, and the unpriced close above is its
+backstop. `npm run activation-fail-control` breaks each property in turn.
+
+### How full the garage was when the car came in (0034)
+
+The engine's **fill rule** ("when the garage is at least X% full, the time-based
+charge is Y% more", rate-engine schema 6) prices on how full the garage was **at
+the moment the car came in**, and nothing about a stay's price moves after
+that. The engine counts nothing; this platform counts, and hands it the figure.
+
+- **`garages.spaces`**: the garage's number of spaces, a whole number from 1 to
+  100000, or null. `PATCH /garages/:id {spaces}` (the owner's session or a key,
+  a change-log line with what it was); `GET /garages` and `GET /garages/:id`
+  return it. The garage map writes its count of switched-on spots here; without
+  a map the owner types it. Anything else is `400 garage_spaces_refused`.
+- **`sessions.occupancy_at_entry_bp`**: `floor(10000 x cars inside / spaces)`,
+  at most 10000, set when the stay opens: every stay of the garage, any kind
+  of space, a car nobody could read included (0036), that was inside **at
+  this car's own entry** -- came in by then and had not come out by then.
+  A lane that delivers its open late counts the cars that were in when the
+  car came in, not when the open arrived; nothing ages a stay out of the
+  count (a stay no exit closed leaves it when it is ended, 0039 below).
+  Counted inside the open's transaction behind
+  a per-garage lock, so two lanes opening at once count each other (n and n+1,
+  never n twice). Null when the garage has no `spaces`. **No lane sets it**:
+  one sent on the open or in an event is ignored.
+- **The close, the try and the reconciler** hand the engine the stay's own
+  figure. The lane's copy of the open stays (`GET /lane/rules`, `/lane/stays`)
+  carries it, and `/lane/rules` carries `spaces`, so a lane pricing offline
+  agrees with the close to the cent; a lane decision priced on another figure
+  is not taken. A try takes `occupancy_at_entry_bp` per stay (0 to 10000).
+- **Refused, nothing stored**: rates with a fill rule for a garage with no
+  `spaces` (`409 plan_needs_spaces`, at the store and the try); a fill rule
+  that does not state both of the owner's answers, `raises_specials` and
+  `raises_vip_extra`, each `"yes"` or `"no"` (`409 fill_rule_answers_missing`,
+  before the engine is asked, which refuses it too); clearing `spaces` while the
+  rates in force have a fill rule (`409 spaces_needed_by_fill_rule`).
+
+`test/fill-rule.test.js` holds each; `npm run fill-rule-fail-control` breaks
+each in turn.
+
+### A garage's taxes
+
+A garage says which taxes it charges — or that it charges none — before it can
+go live (migration 0022): one or the other, and never neither. Since 0023
+every priced close is taxed on what the driver pays — after any validation —
+and this platform still computes no percentage, ever:
+[`rate-engine`](https://github.com/openparking-ai-code/rate-engine)'s `tax.py` is the
+only tax arithmetic there is (*Tax on the stay*, below).
+
+```sh
+curl -H "authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
+  -d '{"tax_set": {"effective_from": "2026-01-01T00:00:00-05:00", "rules": [
+        {"id": "city", "label": "City parking tax", "percent_bp": 1850, "rounding": "nearest", "sequence": 1}]}}' \
+  http://127.0.0.1:3000/api/v1/garages/<id>/tax-sets     # 201, the set as stored
+curl -H 'content-type: application/json' -H "authorization: Bearer $OPERATOR_TOKEN" \
+  -d '{"tax_set": {"effective_from": "2026-01-01T00:00:00-05:00", "rules": []}}' \
+  http://127.0.0.1:3000/api/v1/garages/<id>/tax-sets     # "this garage charges no tax"
+curl -H "authorization: Bearer $OPERATOR_TOKEN" \
+  http://127.0.0.1:3000/api/v1/garages/<id>/tax-sets     # every set, rules in stated order
+```
+
+- **The engine's shape, column for column.** A set is `effective_from` and its
+  rules; a rule is exactly `id`, `label`, `percent_bp` (whole basis points),
+  `rounding` (`up`, `down` or `nearest`, no default) and `sequence`. There is
+  one base, the money actually paid, and the table has no column for another.
+- **Judged by the engine, and by nothing here.** The set goes to the engine's
+  `POST /v1/validate-tax-sets` — its tax loader, the one the close uses —
+  exactly as sent, before this platform reads a field of it. A set it refuses
+  is a `400` carrying its sentence; this platform holds no copy of its rules,
+  in the route or in the table. No engine to ask is
+  `503 rate_engine_unavailable`, and nothing is stored.
+- **Storage is its own refusal.** A set the engine accepts and this platform
+  cannot hold — a NUL byte, a number past PostgreSQL's `integer`, an instant
+  `timestamptz` cannot hold or give back — is `409 tax_set_not_storable`,
+  naming the field and the limit, and never worded as a judgement of the set.
+  A rule's `id` or `label` sent as bytes that are not UTF-8 never gets this
+  far: the body is refused unread (see "The owner signs in"), and nothing is
+  stored.
+  The instant is stored as the engine read it, to the microsecond, and read
+  back in UTC to the microsecond.
+- **Every stored list loads.** Before the save commits, the garage's whole list
+  is read back as a load gets it and handed to the same door; a set that would
+  leave the list unloadable is not stored.
+- **"None" is stated, never inferred.** A set records how many rules it states,
+  and the database holds it to that count when the transaction commits: a
+  half-written set, and a rule added to a set afterwards, are both refused. So a
+  set with no rules is one that *said* zero, and a garage with no set has said
+  nothing.
+- **One verb, append-only.** Stating a set supersedes nothing and nothing is
+  edited; a later `effective_from` is how a rate changes, a tax is added or a
+  tax ends. The application role can read and insert, nothing else. Each set is
+  recorded as a `tax_set_stated` event naming the operator token.
+- **Two sets at one instant is refused, both named** —
+  `409 tax_set_effective_from_taken` — compared as instants, so
+  `10:00-05:00` and `15:00Z` collide. The table's constraint is what sees two
+  requests racing, each of which would load alone.
+
+`npm run taxes-fail-control` breaks each property in turn.
+
+### Tax on the stay: on what the driver pays
+
+Every priced close carries its tax (migration 0023), in one order everywhere:
+
+    base lines  ->  the validation line  ->  the tax lines      fee_minor = the running total
+
+- **The base is what the driver pays** — the subtotal after any validation,
+  before tax. A validation is a price adjustment on what the driver pays; a
+  driver paying nothing is charged no tax and carries **no tax line at all**,
+  not a zero one.
+- **The tax lines are the engine's**: the garage's whole list of sets, the
+  subtotal and an instant go to `rate-engine`'s `POST /v1/tax`, which picks
+  the set in force and writes the lines (`code: 'tax.applied'`). On the lane
+  the same function runs in-process. Tax lines are told by their code, never
+  by their position.
+- **The instant is the stay's exit**: the lane decision's `exit_at` when its
+  numbers are written, the close's own `exit_at` when this platform priced.
+  Never "now".
+- **`sessions.subtotal_minor`** keeps the pre-tax subtotal beside the fee —
+  NULL for a covered or unpriced stay and for every row closed before 0023 —
+  and the table refuses a row whose subtotal plus its tax lines is not its fee.
+- **A lane's decision with no validation is written exactly as the lane
+  decided it**, tax included: it is what the driver was shown. With a
+  validation, the close goes back to the decision's subtotal and base lines,
+  appends the validation, then the tax on the new subtotal; the lane's tax on
+  the full fee is not kept.
+- **A validation is claimed on the pre-tax subtotal**, and the reader is told
+  the taxed discounted figure (`fee_minor`, with `subtotal_minor` and
+  `tax_lines` beside it). The validation record's amounts stay pre-tax; what
+  the reader showed is compared with the discounted subtotal plus the tax the
+  close takes on it, at the same instant — one derivation for both. That tax
+  is taken only for a hold the close could record (`recordableHold`: held, on
+  this fee, with the reader's figure on the close); a released, releasing or
+  unshown hold costs no engine call, so a close consuming a lane's decision
+  still closes while the engine is down.
+- **A garage with no set in force at the instant is a broken invariant**, and
+  the close fails loudly: activation requires a set in force and sets are
+  append-only.
+
+**A stale tax set on the lane is refused, as a stale plan version is.** A set
+may take effect immediately, so a lane refreshed before it was stated would
+tax with the one before. A priced decision carries `subtotal_minor` and
+`tax_sets_held` — how many sets the lane's copy held and the newest
+`effective_from` among them — and the close does not consume it when the garage
+has stated MORE sets than that (the table is append-only, so a lane that missed
+any set, a backdated one included, holds fewer), or when a set later than the
+lane's newest is in force by the decision's exit. Neither test copies the
+engine's choice of set. The first also refuses decisions that were fine — only
+a future set was added — until the lane's next refresh; the close then prices
+for itself, and for that window **a validation cannot be claimed at the reader
+at that garage** (`decision_not_consumable`). That is expected behaviour.
+
+**The reconciler re-derives the base only**, netting the validation and the
+tax lines out of the fee; the tax stands on the table's check and the stale-set
+refusal. `npm run tax-on-paid-fail-control` breaks each property in turn.
+
+### The exit's three outcomes, and the two modules consulted
+
+There are three kinds of customer: monthly or garage pass, transient, and
+transient with a card on file. Every close now names which
+(migration 0015), in `sessions.exit_outcome`:
+
+- **`covered`** — a garage pass or a monthly agreement covers the stay. No
+  transient fee; which module said so, and what it said, is in
+  `sessions.entitlement`, and an `exit_covered` event records the money not
+  charged.
+- **`transient`** — priced through the engine (or unpriced with its refusal).
+- **`transient_card_on_file`** — priced, charged off-session, no tap.
+  **Declared and produced nowhere:** this platform holds no customer, account
+  or card, so no close can say it yet. It is in the vocabulary so the third
+  customer has a seat; a test asserts nothing writes it.
+
+Before pricing, the close consults **`garage-pass`** (`access-in-store
+--direction exit --entered-at`) and **`monthly-billing`** (`covered-in-store --entered-at`)
+— each through its own command line, run as a subprocess with the environment
+this platform was given (`GARAGE_PASS_DSN`, `MONTHLY_BILLING_DSN` are theirs;
+`ENTITLEMENT_BIN_DIR` names where the scripts are, else the PATH). This platform
+imports neither and holds none of their data. Both linked modules are always
+asked; what each printed, its exit code and the argv are kept verbatim on the
+row — the named reason for a not-covered answer as much as for a covered one,
+and no amount ever travels. **A module that cannot answer is not a
+not-covered:** the close answers `500`, rolls back, and the lane retries — a
+pass holder is not billed on the strength of an outage.
+
+**Links are stated, never inferred.** `PUT /api/v1/garages/<id>/entitlement-links`
+with `{"garage_pass": {"tenant_id", "garage_id"} | null, "monthly_billing": … | null}`
+says which garage this is in each module, under which tenant of that module.
+Each stated link is **probed** — the module must answer a question about that
+garage at all — and refused `409 entitlement_link_unanswerable` when it cannot.
+A garage linked to neither prices every exit as transient, on the record. Every
+statement is recorded (`entitlement_links_stated`).
+
+The retention purge nulls `entitlement` (it names the identity) on the sessions
+of every vehicle it redacts and keeps `exit_outcome`. `test/exit-outcomes.test.js`
+builds a database for each module from its own migrations (`garage-pass.pin`,
+`monthly-billing.pin`; CI checks them out), seeds through their doors, and drives
+all of it through the lane's close. `npm run exit-outcomes-fail-control` breaks
+each property in turn.
+
+### A QR shown at the lane: garage-pass binds the car, or says why not
+
+A driver whose car the registers do not cover can scan the QR garage-pass
+issued for it. The lane presents what the scanner read with the identity its
+camera measured: `POST /api/v1/lane/redeem-enrolment` with `{token, vehicle,
+presented_at}` (`vehicle` null when it read none). This platform asks
+garage-pass through its own door, `redeem-enrolment`, under the garage's
+garage-pass link, with the device's own lane and direction — never the
+body's. The module spends the QR once, binds the car and answers the movement;
+both halves come back verbatim beside `open`, which is **true for a covered
+answer and nothing else**. A refused QR is not a refused car: the answer is the
+car's own, so a car the registers already cover still opens on its pass.
+
+Whether the car is the QR's car is garage-pass's decision too — the owner's
+rule of 2026-10-30, *similar enough gets a pass*. A valid QR made for a plate
+passes when the lane read the same plate, the same once look-alikes are one
+character (0OQD, 1IL, 8B, 5S, 2Z, 6G), one character off (only on a QR plate of
+five characters or more), or nothing usable (`vehicle` null). The enrolment half
+is then `recognised`, with `passed_by` naming which — `same_plate`,
+`look_alike`, `one_difference` or `nothing_read` — and `qr_plate` the plate the
+QR answers for, so the lane checks its owner's deny rule against the car it lets
+in. Only a clearly different plate is `match_required`: nothing opens on that QR
+until a picture match or a person confirms it.
+
+- `200` — garage-pass answered; open or shut, and its sentence says why.
+- `409 qr_not_linked` — the garage names no garage-pass garage.
+- `409 qr_stale` — `presented_at` more than two minutes ago; `409 clock_skew`
+  ahead of this server's clock.
+- `429` — the device has presented ten QRs this minute.
+- `503 qr_unanswered` — garage-pass could not answer. The lane treats this as
+  offline: a QR cannot be checked, so a pass-only entry stays shut and the exit
+  is the attendant's.
+
+**The token and the plate are kept nowhere.** The token rides on the module's
+argv because that is its door, and nowhere else: not in the answer, not in an
+error, not in a log line, not in the `qr_presented` event, which records what
+happened to the QR (by its enrolment id, and how the car passed for it:
+`passed_by`, one of the four names or null) and to the gate, and whether the
+lane read an identity — never `qr_plate` or any other plate. A lane posts
+`qr_presented` itself only for a QR it could not present, with
+`answered: false` and nothing beyond `reason`, `direction` and
+`read_identity`. `test/lane-qr.test.js` runs against the real garage-pass;
+`npm run lane-qr-fail-control` breaks each property in turn.
+
+### The rules payload: what the exit decides from, off the barrier's path
+
+The requirement: identify the car and show the fee in about a second; with no
+fee (garage pass, monthly), open the gate in about a second.
+Nothing on the barrier's path may wait on the network, so the lane decides
+from what it already holds — and what it holds comes from `GET /lane/rules`
+(migration 0016):
+
+- **`rate_plans`** — every plan of the garage, whole, as 0012 stores them,
+  oldest first. The engine selects among them by entry time; this platform
+  filters nothing. **`space_class`** — the garage's, which every quote takes.
+- **`entitlements`** — each linked module's register, read through its own
+  `show-garage-register` verb (garage-pass G27, monthly-billing G48) and kept
+  verbatim under `register`, beside the argv and exit code: which vehicle a
+  pass or an agreement holds *at this garage*, its state and its days, in the
+  modules' own words — the lane reads them with its own clock, which is how
+  both verbs are written to be read. A module that is not linked says so; a
+  module whose register **could not be read** says `unavailable`, carries no
+  `register`, and `complete` is false. An outage is never an empty register:
+  a reader replaces a module's facts only when its `register` is present.
+- **`stays`** — the garage's open stays (`plate` or `ticket_ref`, `entry_at`,
+  `entry_lane`) and a **cursor**. A transient cannot be priced without its
+  entry time, and the entry time lives here.
+- **`tax_sets`** — every tax set of the garage, whole, oldest first, each
+  exactly as a load takes it: `effective_from` to the microsecond and its
+  rules (0023). A reader replaces its copy with this list, never merges into
+  it, which is what lets the close judge a stale copy (*Tax on the stay*).
+
+**Two cadences.** Plans, entitlements and settings change rarely; open stays
+change with every car. So `GET /lane/stays?since=<cursor>` is the fast one:
+every stay whose `change_seq` is past the cursor, in order, **closed rows
+included** so a reader drops them; `cursor` is where to continue from and
+`more` says a page filled. `sessions.change_seq` is drawn from one sequence and
+bumped by a trigger whenever the entry, the exit, the vehicle or the entry lane
+changes — every writer moves it without knowing it exists. **The cursor's
+honest limit:** a sequence value is taken when a row is written, and a
+transaction can commit after a later value was already read, so a delta can
+miss such a row. The full open set — on `/lane/rules`, and on `/lane/stays`
+without `since` — is what bounds the miss: a reader takes the full set on the
+slow cadence and the delta on the fast one. `test/rules-payload.test.js` plants
+exactly that race and asserts both halves. The interval a lane polls the fast
+route at is the size of the class of cars that entered too recently to be
+priced at the barrier; that interval is the lane's configuration, not this
+platform's.
+
+**What left the payload:** `hourly_minor` and `rate_id` — an hourly figure
+from the `rates` table that nothing has priced with since 0013 (serving it
+beside the real plans would be two prices on one channel) — and `plate_rules`,
+an empty list. `POST /api/v1/garages/<id>/rates` is **retired by name**: `410
+rates_retired`, pointing at `/rate-plans`. The table stays (`sessions.rate_id`
+and the hourly-legacy rows reference it); nothing writes it.
+
+A rules read records nothing: like the two module verbs it calls, it writes
+no row and appends no event. `npm run rules-payload-fail-control` breaks each
+property in turn.
+
+### The close consumes the lane's decision, and the reconciler checks it out of band
+
+The exit round moved the price to the lane: the barrier shows a fee computed
+on the box, before the boom moves, by the same engine function this platform
+calls, from the plans this platform handed it. One computation feeds the
+screen, the card and the row — so a close that carries the lane's decision
+(`local_decision` on the close body, the lane's `exit_pricing` detail) **writes
+that decision's numbers and does not run the engine again** (migration 0017).
+A close that carries none prices exactly as before. Which path closed the stay
+is on the row: `sessions.decided_by` is `'platform'` or `'lane'`, and every
+closed stay says which.
+
+**What the close does not consume.** A decision that names a session other
+than the one being closed, prices in another currency or space class, names
+a plan version this garage does not hold, carries no pre-tax subtotal or tax
+facts (a lane older than 0023), does not add up (subtotal plus tax lines is not
+its fee), or was taxed with a stale set (*Tax on the stay*) is not written as
+the fee: the close
+prices itself and keeps the decision it did not take on the entitlement record
+under `local_decision_ignored`, with its reason. A lane that could not decide
+(`no_cached_entry`, `stale_facts`, `engine_refused`, `engine_invalid`) says so
+and the close prices itself, as before. A decision whose shape is wrong is a
+`400` by name, and the stay stays open. None of those is a `5xx`: a `5xx` the
+lane classifies as retryable and jams its outbox behind. A covered decision
+closes the stay `exit_covered` without asking either module — the lane read the
+same registers this platform would have — and the event's actor says
+`lane:decision`.
+
+**What stands behind a device-written fee.** The platform now stores a fee a
+device wrote, on a device token. Two things stand behind it:
+
+- **`sessions.decision_inputs`** — everything the lane said it decided from:
+  the entry and exit instants it priced between, the space class, the plan
+  version, the currency, the fee, and the cache's `synced_at` (the rules' and
+  the stays' timestamps and the stays cursor). Stored beside the fee, held to
+  the fee by a CHECK (`lane` carries inputs, `platform` carries none), so the
+  number can be re-derived later from what the lane said it used.
+- **The reconciler** — `laneDecidedCloses` in `src/reconcile.js`, on the
+  operator's reconciliation route, never the barrier's path. It recomputes each
+  lane-decided fee through the engine from those inputs and the plans as
+  stored, and **reports divergence and stops**: `agreed`, `diverged` (the lane's
+  figure and the recomputed one side by side, with the cache's `synced_at`),
+  `inputs_disagree` (the inputs the lane said it used against the row's own
+  entry, exit and class), `unrecomputable` (the engine's refusal, verbatim),
+  `covered_by_lane` (listed, not re-consulted). It corrects nothing: an
+  auto-correcting reconciler on a money record is a way to lose the evidence of
+  the thing it was built to detect. The same shape the file already had.
+
+**And it looks without being asked** (migration 0018). The reconciliation route
+reports on the period an operator asked about — 24 hours by default — so a fee
+written by a device that nobody queries inside that day was never re-derived by
+anything: the record was there, and nothing looked. `npm run
+reconcile-lane-decisions`, on a schedule beside the purge and the shadow
+search, sweeps **every lane-decided close nothing has checked yet, oldest
+first, with no window over it**. `sessions.decision_checked_at` is the queue
+(NULL means never checked) and `sessions.decision_check` is the verdict —
+`agreed`, `diverged`, `inputs_disagree`, `unrecomputable` or `covered` — held
+to it by a CHECK. A verdict that is not `agreed` is also written to `events`,
+which is append-only by grant, so the finding cannot be edited away by
+something that can write `sessions`. **The sweep corrects nothing**, unattended
+least of all: the two columns above are the only ones its statement names. The
+operator's route publishes `lane_decisions_unchecked`, so a sweep that has
+stopped running is visible as a backlog rather than as silence.
+
+`test/lane-decided-close.test.js` plants a lane that writes fee + 1 and asserts
+the reconciler names it and the row is byte-identical after;
+`test/lane-decision-sweep.test.js` plants the same lane on a close **a year
+old** — outside every window the route would report on — and asserts the sweep
+finds it, and that every column of that row but the two is byte-identical
+afterwards.
+`npm run lane-decided-close-fail-control` and `npm run lane-decision-sweep-fail-control` break each property in turn — the
+close pricing again, the inputs not stored, a mismatch consumed, a covered
+decision asking the doors, a blind reconciler, a correcting one, and the
+attribution constraint never created.
+
+### A validation at the exit: a linked module, and one more line on the ledger
+
+This platform does not know what a validation *is*. It asks a linked module a
+question about an opaque key the driver enters at the reader (the lane's
+`phone` field), and the module answers with a discount or with none. The
+module is its own system, asked through its own door as garage-pass and
+monthly-billing are, and **this repository gets the ability to ask, never the
+module** (migration 0019). A garage states which garage of a validations
+module it is —
+`PUT /api/v1/garages/<id>/validations-link` with `{validations: {tenant_id,
+garage_id}}` or `null` — and the link is probed before it is stored.
+
+**Which command is the door is the deployment's to say.** `VALIDATIONS_DOOR`
+names it — a bare command name, found in `ENTITLEMENT_BIN_DIR` or on the PATH —
+and **there is no default**: this repository does not know which module a
+deployment links, so it names none. **Unset means this deployment has no
+validations module.** Stating a link is then refused by name, `409
+validations_not_configured` ("This deployment has no validations module
+configured."), and no door is ever run: a reader claim at an unlinked garage
+answers `not_linked` and a close asks nothing, exactly as without the setting.
+Unlinking (`null`) needs no door. A garage that already links a module while the
+setting is unset cannot be answered for, so it takes the could-not-decide path
+below, by name — never a silent no-validation. Whoever deploys a platform with a
+validations module sets it.
+
+**The claim is made when the phone is entered, not at the close** (amendment
+A1): the close comes after the barrier opens, and the driver has to see the
+discounted amount before paying. The reader shows the fee the lane priced with
+an optional phone number; the lane sends what was entered to
+`POST /api/v1/lane/sessions/<id>/validation` with the decision on screen, and
+this platform reads and, when a validation is live, **claims it for the stay on
+that fee's pre-tax subtotal** and holds it on the open stay. The answer — the
+line, the subtotal before and after, the tax on the discounted subtotal and the
+taxed figure — is what the reader shows next. The claim is made only on a priced
+decision above zero that the close would consume for this very stay; asked
+again on the same subtotal it answers the held claim, without the door.
+
+The discount is **the module's assertion**, checked for shape — whole minor
+units, not more than the fee, the fee and currency echoed back — and it becomes
+**one more line on the ledger**, `code: 'validation'`, after the engine's lines.
+**The close records the held claim — when the reader showed it** (amendment
+A2): the close carries `reader_shown`, `{fee_minor, currency}`, what the reader
+actually put up, and the line is appended, the fee the running total including
+it and the tax after it, only when that is the taxed discounted figure. A
+reader that gave up waiting and
+showed the fee as priced, or a close that says nothing about the reader, gives
+the hold back: the row says what the driver saw. No door asked, nothing
+re-priced.
+
+**No door call is the last word.** The door commits in its own database before
+this platform does, so every call that changes the module is preceded by a
+record committed here — `claiming` before a claim, `releasing` before a release
+— and neither is ever recorded as a discount. A rollback after the door
+answered leaves one of them, and the close or the sweep gives it back:
+releasing a claim that never landed is harmless, the door answers `none`.
+
+**A release names the claim it gives back.** Those door calls happen outside
+any lock here, so a release can reach the module after the same stay has
+claimed again. Every claim is named by the attempt that made it (`--claim`),
+a record keeps the names of the claims it may still hold, and a release names
+those and nothing else; the module refuses to release a claim it no longer
+holds (`already_superseded`). A late release cannot undo a newer claim.
+
+**A hold no close takes is given back** through the module's door
+(`release-in-store`), so a driver who entered a phone and then did not pay and
+leave strands nothing: the validation is unclaimed again, live if its day has
+not ended. The close gives back a hold it cannot take (the stay closed covered,
+unpriced, at another fee, or the reader did not show it) — after it commits, so
+a door that cannot answer leaves `releasing` for the sweep and never refuses a
+close. `npm run release-validation-holds`, on a
+schedule, gives back every hold still on an OPEN stay a hold window after the
+claim (`VALIDATION_HOLD_MINUTES`, default 30), gives back a claim whose hold was
+never stored, and finishes every release begun; the driver who comes back to the
+reader enters the phone and claims again. A close that arrives after its hold
+was given back records no discount, with a `validation_released_before_close`
+event for a human.
+
+**The phone number is never kept.** It goes to the door on stdin — never argv,
+because argv is kept on the record — and into no column, event or log line;
+the door's `phone_last4` is dropped from every answer before it is stored, and
+a refused `phone` field names the field, not the value. The close takes no
+phone at all.
+
+A door that **could not decide** at the reader answers 5xx and nothing is held
+(the record says `claiming`, and is given back);
+a read that says `already_claimed` is asked on, because the claim it names may
+be this stay's own from a claim whose hold was not stored — the module answers
+that claim again. A door that **refused** holds nothing, with a
+`validation_refused` event. The reconciler compares the engine's number with
+the fee **without** the validation line or the tax lines.
+
+`test/validations.test.js` runs against the real engine and a stand-in for the
+door (`test/fixtures/validations-door`, named to the suite by
+`VALIDATIONS_DOOR`) that speaks the door's contract and
+computes nothing; `npm run validations-fail-control` breaks each property in
+turn.
+
+### A garage's own Stripe account
+
+A garage that takes cards takes them into **its own** Stripe account. The
+garage pays its own Stripe fees, and Stripe -- not the deployment -- is
+responsible for the account's losses. The account has no Stripe dashboard of
+its own, so Stripe's onboarding asks the garage about the garage. A deployment that runs
+Stripe Connect creates that account when the operator asks, never implicitly,
+and hands the operator Stripe's own onboarding link; Stripe collects the
+garage's details itself.
+
+- `POST /api/v1/garages/<id>/stripe-account` with `{country}` (two capital
+  letters, e.g. `"US"`; Stripe requires it) creates the account, or answers
+  the one the garage has. A retry, a double click or two requests at once make
+  **one** account: the create is reserved in the database before Stripe is
+  asked, and Stripe is asked with the reservation's idempotency key. **A
+  refused create never locks the garage out:** a bad country is refused before
+  anything is written, and a create Stripe definitely refused (a 4xx, nothing
+  made) is recorded so the next create asks again with a new key. An unknown
+  outcome -- Stripe unreachable, or a 5xx -- keeps its key for Stripe's 24-hour
+  idempotency window, because Stripe may have made the account; after that the
+  create reads Stripe's account list for the one naming this garage, attaches
+  it if it exists, and starts over with a new key if it does not. Two accounts
+  naming one garage are refused by name.
+- `POST /api/v1/garages/<id>/stripe-account/onboarding-link` answers Stripe's
+  onboarding link for the operator to open.
+- `POST /api/v1/garages/<id>/stripe-account/refresh` asks Stripe now and keeps
+  `card_payments`, `charges_enabled` and `details_submitted`, **each with when
+  it was read**. There is no webhook: the platform pulls.
+- `GET /api/v1/garages/<id>/stripe-account` answers what was last read,
+  without asking Stripe.
+
+The account is created with Stripe's Accounts API and its controller
+properties: `stripe_dashboard.type: none`, `fees.payer: account`,
+`losses.payments: stripe`, `requirement_collection: stripe`, with
+`card_payments` requested (and `transfers`, which Stripe requires beside it). None of this is an activation condition.
+
+**Configuration, all of it the deployment's own** (see `.env.example`):
+`STRIPE_API_KEY`, `CONNECT_RETURN_URL` and `CONNECT_REFRESH_URL`. With any of
+the three missing, each route above answers `409 connect_not_configured`,
+*"This deployment has no Stripe Connect configured."*, asks Stripe nothing,
+and every other route behaves exactly as without it.
+
+### The exit, by the car's ID (0037)
+
+The entry and exit cameras are a matched pair under the same light, so a car
+is identified by both ends giving the **same ID**, not by an exact plate: the
+plate as positioned characters, the sure ones folded (`O`/`0`, `I`/`1`,
+`B`/`8`, `S`/`5`) and the rest `?`, under a named rule (`opvid-plate-chars/1`);
+or the fact that it was `unreadable`, or `not_seen`; the colour code
+(`opvid-colour/1`); the size when one is measured. An entry's open may carry
+`plate_characters` (`{state, rule, pattern}`), `color_code` and `size`, and the
+stay keeps them (`entry_plate_state`, `entry_plate_rule`,
+`entry_plate_pattern`, `entry_colour_code`, `entry_size`); the purge nulls them
+with the plate.
+
+**Every car at an exit lane the lane could not let out on its own copy is a
+case** — `POST /api/v1/lane/exits` with `{event_id, exit_at, plate_characters?,
+color_code?, size?, session_id?}`:
+
+| `method` | how the stay was decided |
+|---|---|
+| `lane` | the lane matched it from its own copy and named it (`session_id`) |
+| `single` | one open stay agreed with the car's ID, clearly (`src/exitMatch.js`) |
+| `picker` | a few agreed; the picker chose one by pictures (`src/exitPicker.js`) |
+| `none` | no stay found; the driver has not said yet |
+| `driver_word` | no stay found; the driver's stated entry time was priced |
+| `attendant_pick` | no stay found; a person picked one of the possible cars (0053) |
+| `attendant_time` | no stay found; a person typed the entry time, with a reason, and it was priced (0053) |
+
+**The matcher** excludes a stay on any component that disagrees: a sure
+character that differs in its position, a colour code further than 0.20
+(vehicle-id's stated assumption, not a measurement), a different size, a read
+plate against an unreadable one. An unreadable plate matches unreadable
+plates only; `not_seen` (no picture of the plate at all) says nothing either
+way, as does anything that cannot be compared. A stay wins alone with 3 sure
+characters in agreement (or 2 with the colour or size beside them) and 2 more
+than the next stay; an unreadable plate wins alone when it is the only stay
+left and its colour or size agrees. Otherwise up to 10 candidates go to the
+picker; more than that, or nothing left, is `none`. A stay opened by an older
+lane with a whole plate counts as every position sure.
+
+**The picker** (off unless `EXIT_PICKER_KEY_FILE` names the file holding an
+Anthropic API key, re-read on every ask) is shown the exit's pictures (the
+lane's `POST /pictures` under the case's `event_id`) and each candidate's
+entry pictures, numbered, and asked only which number is the same car, or 0.
+Pictures only: no plate, colour, time or id is sent, and only the number is
+kept, with the model, the time it took and the pictures shown. It is asked
+outside any transaction, within `EXIT_PICKER_TIMEOUT_MS` (8000 by default,
+1000 to 30000), once per car: a resend of the same `event_id` is the same case.
+No answer in time, an answer that is not one number in range, or a candidate
+with no pictures (it could never be chosen) is `none`. The model is
+`EXIT_PICKER_MODEL`, `claude-sonnet-5-5` by default.
+
+**None found:** an `exit_unmatched` event for the attendants, then the
+driver's word — `POST /api/v1/lane/exits/:exitId/word {entry_at}`, once, no
+later than the exit and no more than 90 days before it — priced by the engine
+on the garage's own rules (no module is asked: there is no plate), kept on
+the case, and an `exit_driver_word` event. The stay that car really was stays
+open; a person ends it.
+
+**Settled** is the one thing the lane opens on: covered by a module, a fee of
+zero, paid by card (0038, below), or a person who let the car out. A fee
+above zero says `needs: "payment"`; an unpriced one `needs: "person"`; no
+stay `needs: "driver_word"`. `GET /api/v1/lane/exits/:exitId` is what the
+lane polls.
+
+**A person**: `GET /api/v1/garages/:garageId/exits` lists the cases still at a
+lane, with the candidates and what the picker said.
+`POST /api/v1/garages/:garageId/exits/:exitId/let-out` is **retired** (the
+owner, 2026-11-08: "no manual let out"): it answers `410 let_out_retired`,
+writes nothing, and its one change-log line is the refused attempt. A let-out
+made through it before stays as it was and readable: on the case
+(`person`), on the stay (`let_out`), in its exception and its
+`exit_let_out_by_person` event and `exit.let_out` line; a case that still
+carries one closes as it always did.
+
+**A person decides a car no stay was found for** (0053). Each listed case
+also carries `case`, the shape one case is read in:
+`GET /api/v1/garages/:garageId/exit-cases/:exitId` (`stays:read`) answers
+`{case: {id, lane: {id, name}, raised_at, exit_at, kind: "unmatched" |
+"held" | null, settled, needs, what_happened, what_happened_code, exit:
+{plate, read, folded, picture, pictures}, fee: null | {amount_minor,
+currency, no_fee}, candidates: [{stay, plate, entered_at, pictures, why}],
+decision}}`. The exit's `plate` is what the lane sent: the sure characters
+folded onto look-alikes (O as 0, I as 1, B as 8, S as 5) and `?` where a
+position was not sure, never a whole plate -- so `read` is `sure`, `unsure`
+or `none`. A possible car's `why` is `plate` (every character agrees),
+`partial_plate` or `look`. Each picture id is read as the image itself at
+`GET .../exit-cases/:exitId/pictures/:pictureId`: the exit's own pictures and
+the possible cars' entry pictures, through the case's own garage, and no
+other. `POST .../exit-cases/:exitId/decision` (`stays:change`, as the let-out)
+takes `{stay}` -- one of the case's `candidates`, else `400
+stay_not_a_candidate` -- or `{entered_at, reason}`: a time with its offset,
+no later than the exit and no more than 90 days before it, and a reason of 3
+to 200 characters (90 days: the owner, 2026-11-08). A case that needs a
+decision: no stay found (`needs: driver_word`), or held because its fee could
+not be worked out (`needs: person`) -- open, not let out, with no payment
+started (`409 exit_needs_no_decision`, `exit_closed`, `exit_already_let_out`,
+`payment_in_progress`). The platform prices it -- a picked stay as a matched
+case is priced, credit for what it paid included, `method: attendant_pick`; a
+typed time as the driver's word is, `method: attendant_time` (a held case's
+matched stay is then left open, as for the driver's word) -- and answers
+`{decision: {id, how, stay, entered_at, reason, result: "fee" | "no_fee",
+no_fee, amount_minor, currency, decided_by, done_by, decided_at}, exit}`. What
+the garage's rates cannot price is not recorded: `422 not_priced` with the
+engine's reasons in `details.reasons`, and the case waits for another
+decision. After a decision, a fee is paid at the lane and the case is settled
+paid; no fee is settled at once; either way the lane opens on settled. Once per
+case: a second is `409 already_decided` with the first in `details.decision`.
+An `exit_decided_by_person` event and an `exit.decide` change-log line, no
+plate in either. A stay picked that has another open case supersedes it, as
+a car coming back does -- unless a card is being taken on that case (`409
+stay_paying_elsewhere`): a decision never cancels a payment, so one that loses
+or is refused changes nothing at another lane. 30 decisions a minute per key or person (`429
+too_many_decisions`). It lets no car out whatever it owes: a fee is paid at
+the lane as any fee is, no fee is settled as any fee of zero is, and a case
+that cannot be priced still needs the let-out.
+
+**A second case for the same stay supersedes the first** (0045). A stay has
+one open case at a time, and the lane drops its case when the car leaves the
+loop unsettled: the gate faulted, the car backed off, the driver went to
+fetch a card or to the other exit lane. When the car comes back -- to the
+same lane or another -- its new case takes the old one's place, never a
+second open case:
+
+- the old case's open payment is canceled at Stripe first, and cleared from
+  its reader, outside any transaction; a card being authorised on it, or
+  Stripe out of reach, is `503 payment_unsettled` with nothing written, and
+  the lane sends the case again;
+- if the old payment had already succeeded, the car paid and backed out
+  before the closing loop: **the same stay** (0048, below). The new case
+  prices the WHOLE stay again, credits everything the stay paid at its other
+  cases, and asks only the difference: `fee.fee_minor` is what this exit
+  asks for, `fee.stay_fee_minor` the whole stay, `fee.credit_minor` what it
+  paid. Not priced higher, it asks nothing and is settled `why: "paid"`
+  (`paid_at_exit` names the case whose payment paid it, and `payment` is
+  that payment) -- **"I paid, the gate didn't open": the paid stay opens.**
+  The stay closes at its whole price; its payments add up to it, each part
+  charged once;
+- the old case is closed with no close event and `ended: {why:
+  "superseded", superseded_by}` on the lane's read; an `exit_superseded`
+  event, and an `exit.superseded` change-log line by the lane computer,
+  naming both cases, the stay and how the old payment stood -- no plate.
+
+A case the platform closed answers its lane's close, payment, word and
+let-out with `409 exit_closed`.
+
+The poll, the driver's word and the receipt answer only at the case's own
+lane (`409 exit_on_another_lane`).
+
+**The close** takes `exit_id` instead of a plate. A case with a stay closes it
+— an unread one included — writing the case's own figures (the fee shown, as
+`asDecided`), never a second price. A case with no stay (the driver's word, or
+a person) is closed on the case itself; the response's `session` is `null`.
+
+A case is never deleted (no DELETE grant), is forced under row-level security,
+and names only its own account's lane and stay (a trigger, as 0033's). A lane
+with a case on record is not removed.
+
+### A garage's card reader, bound to a lane
+
+Under direct charges the reader belongs to the garage's own Stripe account,
+not to the deployment. So its **Location** and each **Reader** are registered
+on that account (the `Stripe-Account` header). Stripe reaches the reader over
+the internet; nothing here talks to the device.
+
+- `POST /api/v1/garages/<id>/stripe-account/location` with
+  `{display_name, address: {line1, city, state, postal_code, country}}`
+  registers the garage's one Location, or answers the one it has.
+- `GET /api/v1/garages/<id>/stripe-account/location` answers
+  `{location: {garage_id, location_id, display_name, created_at} | null}`:
+  the Location as this platform recorded it, asking Stripe nothing; another
+  account's garage is `404 garage_not_found`. The address itself is sent to
+  Stripe and not kept here: a caller that wants to show it later writes it in
+  the `display_name` too.
+- `POST /api/v1/lanes/<id>/reader` with `{registration_code, label}` registers
+  the reader showing that code, at the garage's Location, and binds it to the
+  lane. The code is sent to Stripe and kept nowhere here.
+- `POST /api/v1/lanes/<id>/reader/unbind` ends the lane's binding. **The
+  binding is recorded as ended, never deleted**: which reader served which
+  lane, and when, stays on the record.
+- `GET /api/v1/garages/<id>/readers` lists every binding, current ones first.
+
+Each create is **refused while the account cannot take a card**. Stripe is
+asked for `card_payments` at the moment of the request, and the read is kept
+like any other. A lane holds one reader at a time, and a reader serves one
+lane at a time, at the route and at the table.
+
+### Paying at the exit (0038)
+
+An exit case that says `needs: "payment"` is paid with a card, in person, on
+the garage's own Stripe account (direct charges, `Stripe-Account` header):
+one PaymentIntent for the case's fee as shown, `card_present` (and
+`interac_present` in Canadian dollars), captured at once. Nothing here
+touches a card number.
+
+- **At the lane's reader** — `POST /api/v1/lane/exits/:exitId/pay` (the exit
+  lane's device, its own case only) creates the intent and hands it to the
+  reader bound to that lane (`process_payment_intent`). The answer's `sent`
+  is `true`, `false` (the intent was not waiting for a card: paid or being
+  paid), or `"unknown"` (the reader did not acknowledge in time; it may have
+  it — the poll says). `POST .../pay/cancel` cancels the intent at Stripe,
+  idempotently, and clears the reader while it shows it; a card that already
+  paid is never canceled (`409 exit_paid`), and a card being authorised is
+  not cut off (`409 payment_in_progress`).
+- **The reader holding another car's fee.** Stripe refuses a new payment
+  while the reader is busy (`terminal_reader_busy`). The reader is then read:
+  this case's own intent already waiting for its card is `sent: true`;
+  another case's intent -- a car gone whose cancel did not land -- is
+  canceled at Stripe and cleared from the reader first, then this case's is
+  sent, so a driver never pays another car's fee; one that paid in that
+  instant is recorded paid, never canceled. A card being authorised on it,
+  or an action this platform did not start, is `409 reader_busy` and nothing
+  is touched.
+- **At an attendant's phone** — `POST /api/v1/garages/:garageId/exits/:exitId/pay`
+  (an operator token) creates the same intent and answers its
+  `client_secret` for Stripe's Terminal SDK on the phone, with an
+  `exit.payment_start` change-log line.
+
+**One payment per case, one open per stay.** The intent is created with an
+idempotency key derived from the case, so a resend, a retry or a second
+attendant gets the same intent; a declined card is tried again on that intent,
+never a new one. A second case for the same stay cannot start a payment while
+the first is open (`exit_payments_one_open_per_stay`, `409
+stay_payment_elsewhere`). Once one has succeeded, a later case of the stay
+asks only the difference (0048): a payment is exactly what its case asks for,
+and what a stay paid and is paying never adds up to more than its whole fee
+(`exit_payments_within_stay_fee`, a trigger; `409 stay_paid_already` at the
+route, the intent just made canceled).
+
+**Paid is Stripe's word at the recorded amount.** While a payment is open,
+each `GET /api/v1/lane/exits/:exitId` reads the intent from Stripe, at most
+once every 2 seconds; nothing listens for webhooks. The case is settled
+(`why: "paid"`) only when the intent has succeeded at the amount and currency
+recorded. A decline is kept as `last_failure` and the case still needs
+payment. Stripe out of reach is not a failed poll: the case answers as last
+recorded.
+
+Refused before any card: a closed or settled case (`exit_closed`,
+`exit_settled`), one that needs the driver's word or a person first
+(`nothing_to_pay_yet`), another lane's case, a lane with no reader
+(`no_reader_bound`), a garage with no Stripe account, a reader on another
+account, a fee below the card minimum (`fee_below_card_minimum`: a person
+decides). The reader's own refusals are named: `503 reader_offline`,
+`409 reader_busy`.
+
+**A person who lets the car out** while a payment is open cancels the
+intent, so no card is taken for a settled exit; if Stripe says it had
+already succeeded, that is recorded instead — paid and let out.
+
+**Checked against Stripe itself.** The suite runs against a stand-in
+(`test/stripe-stub.js`); `node scripts/stripe-test-mode-check.js` runs the
+platform's own payment calls against Stripe's **test mode** with a simulated
+reader: an intent made once per case, handed to the reader, a second one
+refused while the reader is busy, the reader cleared and an intent canceled
+with its key, a declined card, a good card on the same intent, and a cancel
+of the paid intent refused. It takes only a test key (`sk_test_` or
+`rk_test_`, from the file `STRIPE_TEST_KEY_FILE` names, or `STRIPE_API_KEY`)
+and refuses any other before anything is sent; it never prints the key.
+`STRIPE_TEST_ACCOUNT` (an `acct_` id) is the test connected account it acts
+on as a garage's own; unset, the key's own account. With no key it runs
+nothing (exit 2). It is never run by CI, which holds no key.
+
+**Offline.** The lane's reader is driven from here, so it takes no card
+while it or Stripe is offline: the case still needs payment and a person
+decides. A phone reader may store a card offline and forward it later; that
+payment is not seen here until Stripe has it.
+
+**A text receipt** — `POST /api/v1/lane/exits/:exitId/receipt {phone}`, once
+per paid case, to a **United States or Canadian number only**: the Caribbean
+and US-territory area codes, toll-free, premium and service codes are
+refused (`400 phone_not_us_or_canada`) before anything is sent. The number is
+used for the one send and kept nowhere; the payment keeps its last two
+digits, the time and the provider's reference. The provider is the
+deployment's, read at each send: `TEXT_PROVIDER` (`twilio`), `TEXT_ACCOUNT`,
+`TEXT_KEY_FILE` (an absolute path, re-read every send) and `TEXT_FROM`. With
+any unset, receipts are off (`409 text_receipts_off`).
+
+A payment is never deleted, is forced under row-level security, names only
+its own account's case and stay (a trigger). What it pays for, its amount
+and its intent never change; once succeeded or canceled it stays so; its
+receipt is written once.
+
+### Ending a stay no exit closed (0039)
+
+A car can leave without its exit being seen: a lane down, a gate up, a car
+that tailgated out. Its stay would sit open for ever, count as inside and
+price the next car on a fuller garage. A stay no exit closed is **ended**:
+`exit_at` set, no exit lane, no close event, **unpriced** (no fee, no
+pricing) and `sessions.ended` saying why --
+`{reason: "superseded", at, by_session}`, or `{reason: "ended" | "abandoned",
+at, by, why}` when a person decided.
+
+- **The same car again.** One vehicle row is one whole plate or ticket. An
+  open for a car that already has an open stay, at an entry more than
+  `REAPPROACH_MINUTES` later (default 10, 1 to 60), means the old stay had
+  ended by then: it is ended as superseded at the new entry and the new
+  visit gets its own stay, never folded into the old one. Within
+  `REAPPROACH_MINUTES` it is one arrival -- a car backing out and coming in
+  again -- and the open answers the stay already open, **unless that stay
+  reached an exit lane by then** (0048): a car that has been at an exit has
+  been out, and its entry is a new stay however soon it comes. An open whose entry is
+  **earlier** than a stay of the car already here is an earlier visit
+  delivered late: it is stored already ended, superseded by the next. A car
+  nobody could read (0036) is a vehicle of its own every time, so it never
+  supersedes another. Each superseded stay is a `stay_ended` event. **The old
+  stay is closed completely** (0048): its open exit case is closed with it
+  (`ended: {why: "stay_ended", by: "lane_device:<entry computer>", by_session}`,
+  an `exit_stay_reentered` event and an `exit.closed_on_return` change-log
+  line), its unpaid payment canceled at Stripe first -- a card being
+  authorised, or Stripe out of reach, is `503 payment_unsettled` with nothing
+  written, and the lane sends the open again -- a paid one stays paid and the
+  old stay's `ended` says so (`paid: {exit_id, amount_minor, currency}`, with
+  `exit_cases`); a car a person let out keeps its exception on the old stay.
+- **A late close.** A close whose exit falls inside a stay that was ended
+  (superseded or by a person) closes that stay after all: `ended` cleared,
+  priced like any close, and an `ended_stay_closed` event. A close whose exit
+  is before the stay's entry by no more than twice `MAX_CLOCK_SKEW_SECONDS`
+  is the two lanes' clocks apart: the exit is taken as the entry, with an
+  `exit_before_entry` event. A close with nothing to close names why:
+  `404 session_not_open` for a stay named by id, `404 no_open_stay` for a
+  plate or ticket with no open stay.
+- **The stays looking stuck** --
+  `GET /api/v1/garages/:garageId/stays/stuck?older_than_hours=` (an
+  operator token; 1 to 2160): the open stays that came in more than that
+  many hours ago -- the garage's own `stuck_after_hours` (0043) when the
+  reader names no age -- and those the latest complete walk did not see
+  (0040), oldest first, as `{older_than_hours, stuck_after_hours, stays:
+  [{id, plate, plate_whole, ticket, unread, entered_at, entry_lane, at_exit,
+  last_seen_on_walk, why, pictures}]}`. `pictures` is the entry pictures
+  (0033) kept with the stay's open, newest first, at most 4, each `{id,
+  taken_at}`; `GET .../stays/:stayId/pictures/:pictureId` is one of them,
+  `private, no-store`, and 404 through any other stay or garage.
+- **The garage's age** -- `PATCH /api/v1/garages/:garageId
+  {stuck_after_hours}`: a whole number of hours, 1 to 2160; 24 until the
+  garage sets another. A `garage.update` line with before and after.
+- **A person ends one** --
+  `POST /api/v1/garages/:garageId/stays/:stayId/end {outcome, reason, left_at?}`:
+  `outcome` is `"ended"` (the car left; `left_at`, if given, is when -- not
+  before its entry, not in the future) or `"abandoned"` (the car is gone and
+  nobody knows when; no `left_at`). `reason` is required, at most 500
+  characters on one line (`400 reason_invalid` for a line break or a
+  control character), and kept as typed: a screen shows it as text. **It
+  goes into the change log as typed, so it must not name the car**: a
+  screen that asks for it says so in its help text ("why the stay ended --
+  do not type the plate: the reason goes to the change log"). Once: an
+  ended stay is `409 stay_not_open`. **An exit case left open on the stay**
+  -- the car left the lane without its close, after a let-out or not --
+  **never blocks it** (0045): the case's unpaid payment is canceled at
+  Stripe first, then the case is closed with `ended: {why: "stay_ended",
+  by}`; a payment that succeeded stays paid, is never canceled, and the
+  stay's `ended` carries it (`paid: {exit_id, amount_minor, currency}`,
+  every payment of the stay summed, `exit_id` the latest, with
+  `exit_cases`). **The reads come first** (0048): the stay, `left_at` and
+  what it owes are read before anything is canceled at Stripe, so a refused
+  `left_at` or a rate engine that cannot answer fails the end with every
+  payment as it was. A card being authorised at that moment: `409
+  payment_in_progress`, nothing changed; Stripe out of reach: `503
+  payment_unsettled`. A validation held on the stay is handed to the
+  release. A `stay_ended` event and a `stay.end` change-log line -- who and
+  when, as every line; the stay by its id, the cases it closed and no
+  vehicle; `before: {open, entered_at, exit_at}`, `after: {open, outcome,
+  reason, entered_at, exit_at, owed_minor, currency}`, with
+  `exit_cases_closed` when it closed a case and `paid_minor` when one had
+  paid.
+- **What an ended stay owes (0043).** A stay that `ended` owes what its exit
+  would have charged at `left_at`: the exit's own quote -- the modules
+  asked, then the rates, then the tax. Garage-pass answers for a lane and no
+  lane was crossed, so it is asked at **each of the garage's exit lanes**,
+  and a pass any of them covers covers the stay, as it would have at the
+  exit (the record lists the lanes asked, `asked_at_lanes`). A garage with
+  no exit lane has nowhere to ask: the pass is not asked, and the ending
+  says so -- `pass_unasked: true`, on `ended.owed`, in the end's answer and
+  in the past stays -- so a person can see what was priced without it. It
+  is kept on `ended.owed` (`{outcome, fee_minor, subtotal_minor, currency,
+  breakdown, plan_version, covered_by, refused, pass_unasked, entitlement}`;
+  `entitlement` is what each module was asked and said, and the retention
+  purge takes it out with the vehicle) and answered as `owed_minor`: 0 when
+  covered, null when the rates refused to price it. **A stay that paid at an
+  exit** before a person ended it owes the rest: `owed_minor` -- in the
+  end's answer, its event, its change-log line and the past stays -- is
+  `ended.owed.fee_minor` less `ended.paid.amount_minor`, never below 0;
+  `ended.owed` keeps the exit's whole quote and `ended.paid` what was paid.
+  **Nothing is charged**, whatever card the car has: the stay stays
+  unpriced (`fee_minor` is what a stay paid at its exit), and the garage
+  collects what it owes its own way. An abandoned stay owes nothing.
+  Pricing needs the rate engine: with it down, `ended` is refused as the
+  exit is, and `abandoned` still works.
+
+The past stays (`GET /garages/:garageId/stays/closed`) carry `ended`, the
+reason, on a stay that was ended, and `owed_minor` beside a null `fee_minor`
+on one that owes, with `pass_unasked`; a stay a person let out owing (0042)
+is `let_out_unpaid`, with what it owed as `owed_minor`. The database holds the shape: an ended stay is unpriced,
+has no exit lane or close event, a known reason, and who and why when a
+person decided; only a stay that `ended` may owe, in its own currency, a
+whole number of minor units, nothing when covered.
+
+The routes' permissions, for a platform with linked accounts (#78): the list
+and the pictures are `stays:read`, the end is `stays:change`, and the
+garage's age is `garages:change`.
+
+`test/stay-endings.test.js` and `test/stay-cleanup.test.js` hold each; `npm
+run stay-endings-fail-control` and `npm run stay-cleanup-fail-control` break
+each in turn.
+
+**Counting the cars inside (0044).** Every open counts the cars inside at the
+car's entry behind the garage's lock. `sessions_garage_exit_idx` (tenant,
+garage, `exit_at`) gives the stays that left after that instant, and the
+partial open-stays index the ones still inside, so the count no longer reads
+the garage's whole history. `npm run occupancy-plan` builds a scratch
+database of 300,000 stays and prints the plan and the time before and after;
+0044 builds the index `CONCURRENTLY`, outside a transaction.
+
+### The exit's rules, and the exceptions (0048)
+
+The rules of 2026-10-30/31, and the record kept.
+
+**Paid and left.** After the closing loop the car has paid and left; a car
+that backs out after paying gets credit and is charged the additional part. A stay is finished when the car crosses the closing loop after the
+gate (the close). A car that paid and backed out before it is the same stay,
+with no time limit: at its next exit the WHOLE stay is priced again, every
+payment the stay made at its other cases is credited, and only the
+difference is asked -- nothing when the price is not higher, never a
+negative figure. The case's quote keeps the whole stay's figures (what the
+close writes) with `credit: {paid_minor, payments}` and `due_minor` beside
+them; a quote not priced higher keeps the figures of the case whose payment
+paid it, and the new price as `repriced`; and when that price is LOWER than
+the stay paid -- only a rate change between the payment and the exit, or a
+pass covering it now, can do it, and there should be no reason for it
+-- nothing is refunded and nothing goes negative, and
+the case is marked `repriced_lower: {paid_minor, repriced_minor, outcome}`
+(on the attendant's list of open cases, and in an exception's story) for a
+manager to see. The lane reads `fee.fee_minor` as
+what to pay (the difference), `fee.stay_fee_minor` and `fee.credit_minor`
+beside it. A car let out owing the difference is let out unpaid owing it,
+with what it had paid (`let_out.paid_minor`). **A refund is not paid**:
+before a new case credits the stay's payments, each (the latest 5) is read
+from Stripe with its latest charge, in parallel and outside any transaction,
+and what was refunded of it -- at Stripe's dashboard, which this platform
+hears of nowhere else -- is kept on the payment (`refunded_minor`,
+`refunds_read_at`); only what a payment kept is credited, and the stay-fee
+guard counts it so. Stripe not answering holds no exit up: the payment is
+credited as last read and the case says so (`credit.refunds_unread`). A
+refund is read only then -- when the car comes back to an exit -- once, each
+read given 3 seconds before Stripe is taken as silent; a person's end and a
+return credit what was last read.
+
+**A return is a new stay** -- for a transient car. When the car leaves, its
+stay is over; when it comes back, new time starts. An entry after the stay
+reached an exit lane is never folded back into it (`REAPPROACH_MINUTES` is
+for a re-approach at the entry only); the old stay is closed completely --
+its case closed, its unpaid payment canceled at Stripe, a paid one kept paid
+on it -- and the new stay carries no time, fee, payment, let-out or case
+(above, "The same car again"). A car that never left -- backed off at the
+exit -- is still the same stay: its next case supersedes the old one. **A
+lane's close that arrives after the car came back in** (the exit lane was
+offline, a person opened, the car returned before the outbox drained) is
+still that stay's exit: the stay closes at the time the lane sent -- never
+after the return -- on its case's figures, paid or let out unpaid as the case
+stood, a person's opening with its exception; a resend is the same close, a
+second close event `409 exit_closed`.
+
+**A pass's visits are sessions of the pass.** Monthlies and garage passes are
+different: each visit is a new session. Each in and out of a pass holder is its own
+stay -- a session of the pass -- asked about at its own exit with its own entry
+(`--entered-at`, to both modules), so the pass's own rules (its days, its
+hours, a car replaced on it) are judged per session and nothing carries from
+one to the next: a session the pass does not cover is priced from its own
+entry. The pass a session belonged to is kept on it (`sessions.pass_session`:
+`{module, pass_id, covered, reason, covering_term}`, or the monthly agreement
+that covered it) and the past stays carry it as `pass: {module, pass_id,
+covered}`.
+
+**A car a QR let in.** The lane's open may carry `qr: {enrolment, passed_by,
+qr_plate}` (lane-controller's contract: a registration QR the pass module
+passed `same_plate`, `look_alike`, `one_difference` or `nothing_read`), each
+key only when the module answered it; it is kept on the stay
+(`sessions.entry_qr`), checked to its shape (`400` otherwise; a key this
+build does not know is left on the lane). At the exit garage-pass is asked
+**by the QR's plate** (`asked_as: "qr_plate"` on the record), so a car let in
+on one difference or with nothing read is covered as the pass it is; monthly
+billing is asked by the plate as read, or not at all with none. Garage-pass
+has no verb to ask by an enrolment id: the id and how it passed are kept on
+the stay and on its `pass_session`. The purge takes `qr_plate` with the
+vehicle.
+
+**The exceptions.** Each is recorded with as much information as there is:
+what happened, who did what, the gate agent's messages, their times, who
+received them. Whenever a person lets a car out -- a close naming the case
+with `let_out_by`, a case that closes owing, or an attendant's let-out on
+record from before that route was retired --
+one record per exit case is written in the same transaction: `kind`
+`let_out_unpaid` (it still owed) or `barrier_opened` (a person opened for a
+car that owed nothing more); the garage, lane, stay and case; who pressed it
+(the change log's name for the key or owner, or the lane computer and its
+name) and when; the reason typed; the authority the lane named; what it owed
+and what the stay had paid; and, as it stood at that moment (`story`), the
+case as the lane read it, the stay (never its plate), every payment of the
+stay -- states, times, Stripe's codes, the intent id, never card data -- and
+the lane's events from the window's start, a lane's own detail cut to its
+codes (the reader's refusals of a case's payment among them: each is kept as
+an `exit_reader_refused` event at the lane, `{exit_id, code}`, when the
+lane's pay is refused `reader_offline`, `reader_busy` or `no_reader_bound`).
+Stripe's declines are as the payment last recorded them (`last_failure`): the
+platform keeps the latest, not each. Appended after, never edited: the platform's events at the lane to the window's end (and, on an attendant's let-out from before the retirement, the case's payment once it was canceled), and **the
+gate agent's messages and calls for the lane** over [case opened - 15 min,
+let-out + 15 min], copied with their own ids and revisions -- who was paged,
+on which sink, when, what each answered; who called, who was rung, who
+answered. A call's keyed call-back number is kept as its last two digits
+(`keyed_last2`), as a text receipt keeps its number -- for the records from
+before the gate agent dropped its call-back option; `keyed` no longer
+arrives. The story's case carries its fee's `credit` (`paid_minor`, each
+payment with its `refunded_minor`, and `refunds_unread`) and `repriced_lower`. **Nothing here waits on
+the gate agent**: the exception is written with the let-out, the answer goes,
+and the copy runs after it; a let-out whose exception cannot be written
+stands, the failure is logged by its case, and the sweep writes it from the
+record. **A copy is blanked past its window**: `tenant_settings.exception_copy_retention_days`
+(400 by default, the gate agent's own; 1 to 3650), by `npm run purge`, which
+says how many, nothing else; the exception and the rest stay.
+
+- `GET /api/v1/garages/:garageId/exceptions?day=YYYY-MM-DD` -- the garage's
+  own local day (today when unnamed), oldest first, with `count` and
+  `let_out_unpaid`, and on each exception the gate agent in short --
+  `gate_agent: {messages, failed_deliveries, calls, calls_answered, copy,
+  copies: {messages, calls}, purged}`: from the latest copy of each, the
+  messages and the deliveries of them that failed (`state: "failed"`), the
+  calls and those a person answered (`person_answered_at` set); `copy` is
+  `complete` (copied after the window), `pending` (part-way, or not yet),
+  `not_reachable` or `not_configured`, the worse of the two sources'.
+  `GET /api/v1/garages/:garageId/exceptions/day/:day` is the same list, the
+  day (`YYYY-MM-DD`, the garage's own date) in the path; a day that is not a
+  date from 1970 on is `400 day_invalid`. `GET /api/v1/garages/:garageId/exceptions/:exceptionId`
+  -- one record's whole story, `payment_after_let_out`, `lane_events_after`,
+  each copy of the gate agent's records under `gate_agent: {messages,
+  calls}`, copied or saying why not, and its pictures by id: `pictures:
+  {entry: [{id, taken_at}], exit: [{id, taken_at, exit_id}], lane: [{id,
+  taken_at, lane_id}]}` -- the lane's pictures kept with its stay's entry,
+  with its case and the stay's other cases, and any other its lane kept in
+  its window, as they stand (a picture the retention job deleted is not
+  listed), at most 50 of each. Each image is
+  `GET /api/v1/garages/:garageId/exceptions/:exceptionId/pictures/:pictureId`,
+  `private, no-store`, only for a picture the exception lists. Through the garage only: another
+  account's or garage's is `404 exception_not_found`. The reconciliation
+  report counts them (`exceptions: {since, let_out_unpaid, barrier_opened,
+  total}`). Permissions, for a platform with linked accounts (#78): both are
+  `stays:read`.
+- **Where the gate agent is** is the deployment's: `GATE_AGENTS_FILE` names a
+  JSON file on this server, re-read at each copy --
+  `{"garages": {"<garage id>": {"monitor": {"url", "token_file"}, "agent":
+  {"url", "token_file"}, "lanes": {"<lane id>": {"monitor_lane",
+  "agent_lane"}}}}}`. `monitor_lane` is the lane's own `lane_id` as it
+  publishes it on `GET /v1/lane`; `agent_lane` is the agent's own
+  `[lanes.<name>]`, which is not the lane's id -- the site maps each platform
+  lane to both, once, here. A URL is http or https with no user, query or
+  fragment; off loopback it must be https and name a token file. A token is
+  read from its file at each request and never logged; a redirect is never
+  followed; each request has 3 seconds, an answer at most 4 MiB, at most 10
+  pages of 500. Unset, or a garage or lane not named, is `not_configured`; no
+  answer is `not_reachable`; a refusal or an answer this build cannot read is
+  `refused`, each with a sentence. **Never in the let-out's way**: the car is
+  out first.
+- **`npm run complete-exceptions`**, on a schedule (every few minutes): once
+  an exception's window has passed it copies the gate agent's whole window
+  again (`complete: true`) and the lane's events after the let-out; an
+  unreachable gate agent is asked again, at most 6 times, until 24 hours
+  after the window; a let-out whose own write of its exception failed gets
+  one from the record (`story.recovered`). One tenant at a time; counts only.
+- Written once and appended to, never updated or deleted (no grant); forced
+  under row-level security; an exception names its own case's lane and stay
+  (a trigger).
+
+`test/exit-rules.test.js`, `test/exceptions.test.js` and
+`test/pass-sessions.test.js` (the real garage-pass, at `garage-pass.pin`)
+hold each; `npm run exit-rules-fail-control` breaks each in turn and requires
+the named test red.
+
+### The inventory walk (0040)
+
+> **Held, off by default (2026-11-09).** The walk, the stuck-stays list, ending a stay from
+> it, and the two garage settings that belong to them (`walk_complete_percent`,
+> `stuck_after_hours`) answer 404 `not_switched_on` unless the deployment sets
+> `GARAGE_CLEANUP=on` (`src/held.js`). The owner will go through the walk in detail first.
+> The tables and the code stay; the suite runs with it on, `test/held.test.js` holds the off state.
+
+A person walks the garage with a phone and photographs every car parked
+there, or types its plate. Finished, the walk is four lists, frozen when it
+finishes and never worked out again: the cars seen that have an open stay,
+the cars seen that have none, the open stays nobody saw, and the cars whose
+plate could not be read. It is how a garage finds the stays no exit closed
+(see "Ending a stay no exit closed"): the stuck list reads the walks.
+
+Every route takes an operator token, acts at the garage in its path and
+refuses another tenant's garage or walk, or a walk reached through another
+of its garages (`404 walk_not_found`). Who did each step is the operator
+key it was done with, kept on the walk and on each sighting, with the
+change's own "done by" beside it once changes carry one. Each change is one
+change-log line about the walk -- `walk.start`, `walk.sighting`,
+`walk.pick`, `walk.finish` -- that names no plate.
+
+⚠ **Known limit: "a person" is the operator key, for now.** Nothing on this
+branch reads a person's name from the request yet (that arrives with the
+"done by" of the people and permissions change). So a relay that holds one
+operator key for a whole company makes every attendant on that key the
+same person: they share one walk at a garage, starting again answers it,
+and when one of them finishes it the others' sightings still on their
+phones are refused (`409 walk_finished`). Until then, give each person a
+key of their own, or have one person walk at a time. A walk finished early
+like that usually saw too little of the garage to feed the stuck list (see
+"The stuck list reads the walks").
+
+- **Start** -- `POST /api/v1/garages/:garageId/walks {}` →
+  `201 {walk: {id, started_at}}`. A person has one unfinished walk at a
+  garage: starting again answers that walk (`200`), so a phone that lost it
+  carries on. Other people start their own. A walk left unfinished
+  `WALK_ABANDON_HOURS` (12) after it started is **abandoned**: it takes no
+  more sightings, picks or finish (`409 walk_abandoned`), has no lists, and
+  its person's next start begins a new walk.
+- **A sighting** --
+  `POST /api/v1/garages/:garageId/walks/:walkId/sightings
+  {picture?, plate?, confirmed, client_ref?, confirms?, taken_at?}` →
+  `201 {sighting: SIGHTING}`.
+  - `picture`: a JPEG or a PNG, base64, at most 3 MiB, as a lane's picture.
+    It is opened and written fresh (no metadata, no location), sent to the
+    deployment's vehicle-id to read. That fresh picture is kept
+    `PICTURE_DAYS` (30) from when it was taken, as a lane's picture is, so a
+    person can look at it again -- longer when a finished walk listed it as
+    seeing a stay (*Picture retention*) -- then it is forgotten and the
+    sighting keeps what was read. The reader is fast-alpr, the one plate reader.
+  - `plate`: a plate the person typed or confirmed, with `confirmed: true`
+    (`400 plate_not_confirmed` without it): letters and digits, 1 to 10 once
+    spaces and dashes are taken out. A sighting with a plate is matched on
+    it, picture or not.
+  - `client_ref`: the phone's own id for the sighting, at most 100 characters.
+    The phone sends again when it heard no answer; the same `client_ref` on
+    the same walk answers the sighting already kept (`200`), so it is counted
+    once. Without one, the same picture sent again (the same bytes) answers
+    the sighting already kept, read once; a plate typed again is a second
+    sighting, but a car seen twice lists once, with or without a stay.
+  - `confirms`: the id of an earlier sighting of this walk that this one
+    answers -- the person's reading of a plate the reader was unsure of. The
+    earlier one leaves the lists; this one stands for it. A typed plate sent
+    with neither `confirms` nor `client_ref` (a phone that answers a
+    sighting by typing its plate) answers an earlier one only where that can
+    be told: the one unanswered `unsure` sighting whose sure characters all
+    agree with the plate. A `none` has no character to agree with, so only
+    `confirms` answers it: without one it stays in `not_readable`. Anything
+    else is a new car. The change-log
+    line says `confirms_inferred: true` when the platform worked it out.
+  - `taken_at`: when the picture was taken (not in the future); the time it
+    arrived otherwise.
+  - Refused: `409 walk_finished` on a finished walk, `409 walk_abandoned` on
+    an abandoned one; `409 walk_full` past 5000 on one walk (finish it and
+    start another); `429 too_many_sightings` past `SIGHTINGS_PER_MINUTE`
+    (120) a minute from one key, before the picture is opened, since every
+    picture is opened by the same one-at-a-time decoder as the lanes'
+    pictures -- with `Retry-After`, the whole seconds (at least 1) until that
+    key's minute ends: the phone waits that long and keeps the picture until
+    it is saved;
+    `400 confirms_invalid` for `confirms` that is not a sighting of this walk and `409 sighting_already_confirmed` for one a
+    later sighting already answers; `400 picture_invalid` for a picture that
+    does not open; `503 reader_unanswered` when vehicle-id did not answer
+    (nothing is kept: send it again).
+
+  `SIGHTING` is `{id, plate, read, why, readers, needs_confirmation,
+  plate_characters, candidates, picked_stay, confirms, has_picture, taken_at,
+  added_by}` (`why`, on
+  `read: "none"` only: `unreadable`, `not_seen` or `reader_off`):
+
+  | the reader's answer | `read` | `plate` | `needs_confirmation` |
+  |---|---|---|---|
+  | every character sure | `agreed` | the whole plate | `false` |
+  | some characters sure | `unsure` | the pattern, `?` where unsure | `true` |
+  | nothing sure, or nothing read | `none` | `null` | `true` |
+  | a plate the person gave | `typed` | that plate | `false` |
+
+  `readers` is `[{reader: "fast-alpr", plate, confidence}]` for a picture
+  (empty for a typed plate). `plate_characters` is vehicle-id's
+  `{state, rule, pattern}`, what the matching uses. A read with every
+  character sure but an empty `plate` takes the pattern as its plate. With
+  no vehicle-id set up (`VEHICLE_ID_URL` unset), a picture is kept as
+  `read: "none"`, `why: "reader_off"`, for the person to type. `candidates` is the open
+  stays the plate fits when there is more than one, `[{stay, plate,
+  entered_at}]`, for the person to pick.
+- **Pick** -- `POST /api/v1/garages/:garageId/walks/:walkId/sightings/:sightingId/pick {stay}`
+  → `200 {sighting}`: which of its candidates the car is. `400
+  stay_not_a_candidate` for any other stay; `409 walk_finished` or
+  `409 walk_abandoned` once the walk is closed.
+- **Finish** -- `POST /api/v1/garages/:garageId/walks/:walkId/finish {}` →
+  `200 {walk: {id, started_at, finished_at, lists: WALK_LISTS, feeds_stuck,
+  seen_percent, complete_percent, incomplete}}`, again the same on a finished
+  walk. `WALK_LISTS` is
+  - `seen_with_stay`: `[{stay, plate, entered_at, sightings}]` -- a stay a
+    sighting's plate matched alone, or the one the person picked; listed
+    once however many times it was seen.
+  - `seen_without_stay`: `[{sighting, plate, candidates, sightings}]` -- a
+    plate no open stay fits, or one that fits several and was not picked (its
+    candidates stay in the next list); one whole plate is listed once, with
+    every sighting of it.
+  - `stay_not_seen`: `[{stay, plate, entered_at}]` -- the stays open when the
+    walk started, still open at its end, that no sighting matched. A stay that
+    came in after the walk started is never "not seen".
+  - `not_readable`: `[{sighting, plate: null, why}]` -- a picture with nothing
+    sure on it, not answered by a later sighting.
+  - `incomplete`: `"walk incomplete (N%)"` when the walk saw too little to
+    feed the stuck list, otherwise null.
+
+  `feeds_stuck` says whether this walk's "not seen" list feeds the stuck
+  list (below): only when the walk saw at least the garage's
+  `walk_complete_percent` of the stays it was checking -- those open when it
+  started and still open at its end. The setting is 80 unless the garage
+  sets another, 1 to 100 (`PATCH /garages/:id {walk_complete_percent}`,
+  0040); the walk keeps the one in force when it finished
+  (`complete_percent`). `seen_percent` is the share it saw, rounded down,
+  null when there was no stay to check; the comparison is made whole, so
+  exactly the setting feeds. A walk under it -- no sightings, or part of the
+  garage -- keeps its lists as they are, lists no stay as stuck, and says
+  `incomplete: "walk incomplete (N%)"` in its answer and its lists.
+- **Read** -- `GET /api/v1/garages/:garageId/walks/:walkId` → the walk
+  (`abandoned_at` set once abandoned, `feeds_stuck`, `seen_percent`,
+  `complete_percent` and `incomplete` once finished), its
+  sightings and, once finished, its lists.
+- **A sighting's picture** --
+  `GET /api/v1/garages/:garageId/walks/:walkId/sightings/:sightingId/picture`
+  → the image bytes, `image/jpeg` or `image/png`, `Cache-Control: private,
+  no-store`; `404` when the sighting has none, its days are over, or it is
+  not this walk's.
+
+**Matching** is the exit's (0037, `src/exitMatch.js`): the sure characters in
+their positions, folded, against the garage's stays open at some point during
+the walk. **A phone's picture is not the lane's camera** -- other light, other
+distance -- so the colour and the size from a walk picture never exclude a
+stay, and a phone's "unreadable" is never matched against a lane's: the plate
+characters decide.
+
+**The stuck list reads the walks**: `last_seen_on_walk` is when a finished
+walk last saw the stay, and a stay the garage's latest walk that feeds the
+stuck list did not see, and no walk finished after it saw, is listed
+whatever its age, with `why: "not_seen_on_walk"`. A listing only shows the
+stay to a person: nothing ends a stay but a person, with a reason ("Ending
+a stay no exit closed"). Ending one means the exit no longer finds it, so
+that car would leave on the driver's word: end a stay only once it is
+really gone.
+
+**Frozen in the database**, not only in the code: once a walk is finished
+or abandoned, its row never changes (no new lists, never open again), its
+sightings take nothing new and change only by losing their picture after
+its days, and its listed stays are never added to; the application role
+cannot delete a sighting or a listed stay at all (they go with their walk),
+nor change a listed stay. A sighting never moves to another walk, open or
+closed, so it never leaves a finished walk's record for an open walk's
+share.
+
+The walks hold plates and are personal data: a walk is deleted with its
+sightings once it finished or was abandoned -- or, neither, started --
+longer ago than the tenant's retention window (`retention_days`), in the
+same purge as the vehicles -- and not while one of its pictures is still
+kept: deleting the walk would take the picture with it. Its pictures go by
+the picture job (*Picture retention*). One car's kept picture does not keep
+the others' plates (0046): past the window, a sighting whose picture is gone
+has its plate, its characters and the readers' plates blanked
+(`plate_blanked_at`), and the lists keep a plate only on the
+`seen_with_stay` row of the stay that keeps the picture; rows, stay ids and
+what was read stay. The freeze triggers allow exactly that blanking on a
+closed walk, and nothing else.
+
+### Picture retention
+
+The lane's pictures (`entry_pictures`, 0033) and the walk's (0040) are
+removed by one scheduled job, `npm run purge-pictures`, daily (`npm run
+purge` runs it too, first), one tenant at a time under that tenant's row
+security. It prints one line, counts only: `pictures: N tenant(s); removed
+L lane picture(s) and W walk picture(s).`
+
+- **30 days after it was taken**, a picture goes. A day is 24 hours,
+  whatever the database's time zone; the 30th day over is gone, so a
+  picture exactly 30 days old is removed and one a second younger is kept.
+- **A stay keeps the pictures it holds**: the lane's of its entry, and a
+  walk's that a finished walk listed as seeing it (in `seen_with_stay`,
+  itself or through the typed plate that answered it). It keeps them while
+  the car is inside, then for 30 days after it left -- by the exit, or by a
+  person ending it -- and while its customer has paid picture storage.
+- **Paid storage** is `sessions.pictures_paid_until` (0041): the time up to
+  which the stay's customer has paid to keep its pictures. **Nothing writes
+  it yet**: a storage fee is money, taken where a stay's money is (the
+  payment at the exit), and that payment does not take one.
+- **A car on the banned list** keeps its lane pictures while listed.
+- **An exit decision** keeps no picture of its own: no exit case points at
+  a walk picture. The walk pictures of the stay it closed are the stay's,
+  kept with the stay, as above.
+
+## Deploying
+
+⚠ **Behind a proxy, declare `TRUST_PROXY`** (see "The owner signs in" for its
+forms). Without it the platform sees every caller as the proxy's one address:
+the sign-in lock and the attempt limit become one for everyone, and the
+change log's bound on refused attempts (0028) counts every caller with no
+sign-in as ONE source -- so one caller's flood takes everyone's refused
+attempts onto a single too-many line. The bound still holds; it can no longer
+tell callers apart.
+
+### When the database goes away
+
+A Postgres restart, a failover or an ended backend (57P01) does not end the
+platform. A request whose connection is lost before its COMMIT is sent is run
+once more on a fresh connection: Postgres rolled the first try back, so a
+change and its change-log line are written once, together, or not at all.
+Then, still unreachable, it is answered `503 database_unavailable`, "Nothing
+was changed", with `Retry-After: 5`. A connection lost while the COMMIT is on
+its way is not tried again, because it may have been saved: `503
+database_unavailable_saving` tells the caller to look before sending it again.
+A lane treats both as any 5xx and sends again; its opens and closes are keyed
+by their event ids. The few transactions that do something outside this
+database before they commit -- an invite's email, a validation claim, a shadow
+search -- are not tried twice. `/healthz` asks the database: `503
+{"ok":false,"db":"unreachable"}` while it cannot be reached, `200
+{"ok":true,"db":"connected"}` again when it can, with no restart. The log
+names the code only. `test/db-restart.test.js` runs the real process while its
+connections are ended under load; `npm run db-restart-fail-control` breaks
+each part in turn.
+
+## Vehicle identity and retention
+
+The database stores real vehicle identity — plate, make, model, colour — because
+that is the product. Transient identity is redacted **30 days after the stay
+closes** by default, configurable per tenant; enrolled vehicles persist while
+enrolled. `npm run purge` enforces it, and it redacts rather than deletes so the
+financial record survives. See [docs/DATA_RETENTION.md](docs/DATA_RETENTION.md).
+
+The **repository** contains no real data at all: fixtures and tests use invented
+values, enforced by `npm run check-no-real-data`.
+
+## Licence and contributing
+
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
+
+Open Parking AI does not accept outside contributions. Pull requests, issues and comments are limited to the maintainers.
+
+---
+
+Built by 72 Knots Method by 72Knots.ai

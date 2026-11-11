@@ -1,0 +1,557 @@
+/**
+ * The registry of tenant-owned tables and how to put one row in each.
+ *
+ * This exists so the isolation suite is written ONCE and runs against every
+ * table, rather than being copy-pasted per table. The foundation's suite named
+ * `parking_sites` nine times; that pattern does not survive six more tables
+ * without one of them quietly ending up untested.
+ *
+ * Adding a table here is how it gets isolation coverage. Forgetting to is
+ * caught separately by test/rls-coverage.test.js, which walks the schema
+ * itself rather than this list.
+ */
+
+export const TENANT_TABLES = [
+  {
+    table: 'exits',
+    // A car at an exit that found no stay (0037): each its own event id.
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+         VALUES ($1, $2, $3, 'tt' || replace(gen_random_uuid()::text, '-', ''), now(), 'none')
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of why a car was let out: updated as it settles, never deleted.
+    noDelete: true,
+  },
+  {
+    table: 'exit_payments',
+    // A payment started at a phone reader (0038) for a case of its own.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH e AS (
+           INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+           VALUES ($1, $2, $3, 'tp' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id)
+         INSERT INTO exit_payments (tenant_id, garage_id, exit_id, channel, account_id, payment_intent_id, amount_minor, currency, started_by)
+         SELECT $1, $2, e.id, 'phone_reader', 'acct_tt', 'pi_tt' || replace(gen_random_uuid()::text, '-', ''), 500, 'usd', 'test' FROM e
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of money taken: never deleted.
+    noDelete: true,
+  },
+  {
+    table: 'exceptions',
+    // A car a person let out (0048), about a case of its own at that case's lane.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH e AS (
+           INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+           VALUES ($1, $2, $3, 'tx' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id)
+         INSERT INTO exceptions (tenant_id, garage_id, lane_id, exit_id, kind, source, done_by, let_out_at, case_opened_at,
+                                 window_from, window_to, story)
+         SELECT $1, $2, $3, e.id, 'let_out_unpaid', 'attendant', 'test', now(), now(),
+                now() - interval '15 minutes', now() + interval '15 minutes', '{}'::jsonb FROM e
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // The record of what happened: written once, never edited or deleted.
+    appendOnly: true,
+  },
+  {
+    table: 'exception_records',
+    // What was learned after a let-out (0048), appended to an exception of its own.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH e AS (
+           INSERT INTO exits (tenant_id, garage_id, lane_id, event_id, exit_at, method)
+           VALUES ($1, $2, $3, 'tr' || replace(gen_random_uuid()::text, '-', ''), now(), 'none') RETURNING id),
+         x AS (
+           INSERT INTO exceptions (tenant_id, garage_id, lane_id, exit_id, kind, source, done_by, let_out_at, case_opened_at,
+                                   window_from, window_to, story)
+           SELECT $1, $2, $3, e.id, 'barrier_opened', 'lane', 'test', now(), now(),
+                  now() - interval '15 minutes', now() + interval '15 minutes', '{}'::jsonb FROM e
+           RETURNING id)
+         INSERT INTO exception_records (tenant_id, exception_id, source, state, detail)
+         SELECT $1, x.id, 'gate_agent_messages', 'not_configured', 'gate agent not configured: test' FROM x
+         RETURNING id`,
+        [t, w.garage, w.exitLane],
+      ),
+    // Appended to and never deleted; a gate-agent copy is blanked by the
+    // retention purge and changes in no other way (its trigger).
+    noDelete: true,
+  },
+  {
+    table: 'entry_pictures',
+    // A picture kept with an entry (0033): each its own picture_ref, so rows
+    // collide with nothing but a policy.
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO entry_pictures (tenant_id, garage_id, lane_id, picture_ref, event_id, taken_at, content_type, image)
+         VALUES ($1, $2, $3, gen_random_uuid()::text, gen_random_uuid()::text, now(), 'image/png', '\\x89504e470d0a1a0a'::bytea)
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
+    table: 'banned_vehicles',
+    // Each row lists its own tailgater stay (0033).
+    insert: (c, t, w) =>
+      c.query(
+        `WITH v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'BAN-' || gen_random_uuid()) RETURNING id
+         ), s AS (
+           INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                                 open_event_id, entry_confirmation, tailgater)
+           SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text,
+                  'confirmed', true FROM v
+           RETURNING id
+         )
+         INSERT INTO banned_vehicles (tenant_id, garage_id, session_id) SELECT $1, $2, s.id FROM s
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
+    table: 'garages',
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO garages (tenant_id, name, timezone, currency)
+         VALUES ($1, 'Row', 'UTC', 'USD') RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'lanes',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,'Row','entry') RETURNING id`,
+        [t, w.garage],
+      ),
+  },
+  {
+    table: 'vehicles',
+    insert: (c, t) =>
+      c.query(`INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'ROW-' || gen_random_uuid()) RETURNING id`, [t]),
+  },
+  {
+    table: 'rates',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO rates (tenant_id, garage_id, name, hourly_minor) VALUES ($1,$2,'Row',100) RETURNING id`,
+        [t, w.garage],
+      ),
+  },
+  {
+    table: 'sessions',
+    // Each row gets its own vehicle: sessions_one_open_per_vehicle allows only
+    // one open session per vehicle per garage, so reusing one would collide
+    // with the index rather than with a policy — and the test would then be
+    // measuring the index, not isolation.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'S-' || gen_random_uuid()) RETURNING id
+         )
+         INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                               open_event_id, entry_confirmation)
+         SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text,
+                'confirmed' FROM v
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
+    table: 'shadow_searches',
+    // Each row closes its own stay, and the unique key is the close event, so
+    // rows do not collide with anything but a policy.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'SH-' || gen_random_uuid()) RETURNING id
+         ), s AS (
+           INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                                 open_event_id, entry_confirmation)
+           SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text,
+                  'confirmed' FROM v
+           RETURNING id
+         )
+         INSERT INTO shadow_searches (tenant_id, garage_id, session_id, close_event_id, candidate_ids,
+                                      candidates_open, candidates_with_descriptor, true_stay_comparable)
+         SELECT $1, $2, s.id, gen_random_uuid()::text, ARRAY[s.id], 1, 1, true FROM s
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
+    table: 'rate_plans',
+    // A document the STORE would accept from the database's side: the version
+    // and the instant are unique per garage, and the currency is the world's
+    // garage's, which the trigger checks. What the engine would say about it
+    // is the route's business, not this table's.
+    insert: (c, t, w) => {
+      const version = `Row-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const at = new Date(Date.now() - Math.floor(Math.random() * 1e9)).toISOString();
+      return c.query(
+        `INSERT INTO rate_plans (tenant_id, garage_id, plan_version, effective_from, document, engine_schema_version)
+         VALUES ($1, $2, $3, $4::timestamptz, $5::jsonb, 1) RETURNING id`,
+        [t, w.garage, version, at,
+         JSON.stringify({ plan_version: version, effective_from: at, currency: w.currency })],
+      );
+    },
+    // Append-only by grant, like events; that the grants are absent is
+    // asserted in rate-plans.test.js rather than assumed here.
+    appendOnly: true,
+  },
+  {
+    table: 'garage_tax_sets',
+    // A set stating no rules (0022), at an instant of its own: one set per
+    // instant per garage, so rows collide with nothing but a policy.
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count)
+         VALUES ($1, $2, now() - random() * interval '100000 days', 0) RETURNING id`,
+        [t, w.garage],
+      ),
+    // Append-only by grant; asserted in taxes.test.js.
+    appendOnly: true,
+  },
+  {
+    table: 'garage_tax_rules',
+    // A set stating one rule and the rule, in one statement: the set must
+    // hold exactly what it states when the transaction commits.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH s AS (
+           INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count)
+           VALUES ($1, $2, now() - random() * interval '100000 days', 1) RETURNING id
+         )
+         INSERT INTO garage_tax_rules (tenant_id, tax_set_id, rule_id, label, percent_bp, rounding, sequence)
+         SELECT $1, s.id, 'row', 'Row', 100, 'nearest', 0 FROM s
+         RETURNING id`,
+        [t, w.garage],
+      ),
+    appendOnly: true,
+  },
+  {
+    table: 'garage_changes',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO garage_changes (tenant_id, garage_id, outcome, actor_kind, actor_id, action, subject_kind)
+         VALUES ($1, $2, 'done', 'key', gen_random_uuid(), 'garage.update', 'garage') RETURNING id`,
+        [t, w.garage],
+      ),
+    // Append-only by grant and by trigger (0026); asserted in change-log.test.js.
+    appendOnly: true,
+  },
+  {
+    table: 'events',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO events (tenant_id, garage_id, lane_id, event_id, kind, occurred_at)
+         VALUES ($1,$2,$3, gen_random_uuid()::text, 'probe', now()) RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+    // Append-only: the app role has no UPDATE or DELETE grant, so those two
+    // assertions do not apply. That the grants are actually absent is asserted
+    // in rls-coverage.test.js rather than assumed here.
+    appendOnly: true,
+  },
+  {
+    table: 'tenant_settings',
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO tenant_settings (tenant_id, vehicle_retention_days) VALUES ($1, 30)
+         ON CONFLICT (tenant_id) DO UPDATE SET updated_at = now() RETURNING tenant_id AS id`,
+        [t],
+      ),
+    // One row per tenant by construction, so there is no second row to plant.
+    singleton: true,
+  },
+  {
+    table: 'operator_tokens',
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO operator_tokens (tenant_id, name, token_hash)
+         VALUES ($1,'Row', md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text)) RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'operator_users',
+    // One admin per tenant (0024), so a second insert for the same tenant
+    // touches the first rather than colliding with UNIQUE (tenant_id).
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO operator_users (tenant_id, email, password_hash)
+         VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com', 'scrypt$row')
+         ON CONFLICT (tenant_id) DO UPDATE SET password_changed_at = now() RETURNING tenant_id AS id`,
+        [t],
+      ),
+    singleton: true,
+  },
+  {
+    table: 'operator_sign_in_locks',
+    // A lock row belongs to the tenant's one admin, made here if it is not.
+    insert: (c, t) =>
+      c.query(
+        `WITH u AS (
+           INSERT INTO operator_users (tenant_id, email, password_hash)
+           VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com', 'scrypt$row')
+           ON CONFLICT (tenant_id) DO UPDATE SET password_changed_at = now() RETURNING id, tenant_id
+         )
+         INSERT INTO operator_sign_in_locks (tenant_id, user_id, address)
+         SELECT tenant_id, id, gen_random_uuid()::text FROM u RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'operator_passkeys',
+    // A passkey belongs to the tenant's one admin, made here if it is not.
+    insert: (c, t) =>
+      c.query(
+        `WITH u AS (
+           INSERT INTO operator_users (tenant_id, email, password_hash)
+           VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com', 'scrypt$row')
+           ON CONFLICT (tenant_id) DO UPDATE SET password_changed_at = now() RETURNING id, tenant_id
+         )
+         INSERT INTO operator_passkeys (tenant_id, user_id, credential_id, public_key, name)
+         SELECT tenant_id, id, replace(gen_random_uuid()::text, '-', ''), '\\x000102030405060708090a0b0c0d0e0f'::bytea, 'Row'
+           FROM u RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'linked_sessions',
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO linked_sessions (tenant_id, token_hash, person, email, all_garages, permissions, version, expires_at)
+         VALUES ($1, md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text), gen_random_uuid(),
+                 'iso-' || gen_random_uuid()::text || '@example.com', true, '{}', 'v1', now() + interval '1 hour')
+         RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'operator_invites',
+    // Every row here is an invite already used, so the one-live-per-tenant
+    // and one-live-per-email indexes (0032) never meet a policy test.
+    insert: (c, t) =>
+      c.query(
+        `INSERT INTO operator_invites (tenant_id, email, token_hash, expires_at, used_at)
+         VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com',
+                 md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text), now() + interval '7 days', now())
+         RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'operator_password_resets',
+    // A reset belongs to the tenant's one admin, made here if it is not; each
+    // row is one already used, so one-live-per-admin never meets a policy test.
+    insert: (c, t) =>
+      c.query(
+        `WITH u AS (
+           INSERT INTO operator_users (tenant_id, email, password_hash)
+           VALUES ($1, 'iso-' || gen_random_uuid()::text || '@example.com', 'scrypt$row')
+           ON CONFLICT (tenant_id) DO UPDATE SET password_changed_at = now() RETURNING id, tenant_id
+         )
+         INSERT INTO operator_password_resets (tenant_id, user_id, token_hash, expires_at, used_at)
+         SELECT tenant_id, id, md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text), now() + interval '1 hour', now()
+           FROM u RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'garage_stripe_accounts',
+    // One per garage (0020), so each row gets a garage of its own.
+    insert: (c, t) =>
+      c.query(
+        `WITH g AS (
+           INSERT INTO garages (tenant_id, name, timezone, currency)
+           VALUES ($1, 'Row', 'UTC', 'USD') RETURNING id
+         )
+         INSERT INTO garage_stripe_accounts (tenant_id, garage_id, create_idempotency_key, create_requested_by)
+         SELECT $1, g.id, 'row-' || gen_random_uuid(), 'test' FROM g
+         RETURNING id`,
+        [t],
+      ),
+    // Updated as Stripe is re-read; never deleted -- the grant has no DELETE.
+    noDelete: true,
+  },
+  {
+    table: 'garage_terminal_locations',
+    // One per garage (0021), so each row gets a garage of its own.
+    insert: (c, t) =>
+      c.query(
+        `WITH g AS (
+           INSERT INTO garages (tenant_id, name, timezone, currency)
+           VALUES ($1, 'Row', 'UTC', 'USD') RETURNING id
+         )
+         INSERT INTO garage_terminal_locations (tenant_id, garage_id, account_id, location_id, display_name, created_by)
+         SELECT $1, g.id, 'acct_stubRow', 'tml_stub' || replace(gen_random_uuid()::text, '-', ''), 'Row', 'test' FROM g
+         RETURNING id`,
+        [t],
+      ),
+    // Insert-only: the grant has no UPDATE or DELETE.
+    appendOnly: true,
+  },
+  {
+    table: 'lane_readers',
+    // One reader per lane at a time, so each row binds on a lane of its own.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH l AS (
+           INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1, $2, 'Row', 'exit') RETURNING id, garage_id
+         )
+         INSERT INTO lane_readers (tenant_id, garage_id, lane_id, account_id, location_id, reader_id, label, bound_by)
+         SELECT $1, l.garage_id, l.id, 'acct_stubRow', 'tml_stubRow', 'tmr_stub' || replace(gen_random_uuid()::text, '-', ''), 'Row', 'test'
+           FROM l
+         RETURNING id`,
+        [t, w.garage],
+      ),
+    // Ending a binding is the one UPDATE there is; there is no DELETE.
+    noDelete: true,
+  },
+  {
+    table: 'alert_contacts',
+    // At most 25 a garage (0029), so each row is the first of a garage of its own.
+    insert: (c, t) =>
+      c.query(
+        `WITH g AS (
+           INSERT INTO garages (tenant_id, name, timezone, currency) VALUES ($1, 'Row', 'UTC', 'USD') RETURNING id
+         )
+         INSERT INTO alert_contacts (tenant_id, garage_id, name, email)
+         SELECT $1, g.id, 'Row', 'row@example.com' FROM g
+         RETURNING id`,
+        [t],
+      ),
+  },
+  {
+    table: 'board_messages',
+    // A message is on at least one lane at every commit (0030): written with the world's way in.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH m AS (
+           INSERT INTO board_messages (tenant_id, garage_id, text) VALUES ($1, $2, 'Row') RETURNING id
+         ), l AS (
+           INSERT INTO board_message_lanes (tenant_id, message_id, lane_id) SELECT $1, m.id, $3 FROM m
+         )
+         SELECT id FROM m`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
+    table: 'board_message_lanes',
+    // A message of its own, shown on the world's way in: one row per message and lane.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH m AS (
+           INSERT INTO board_messages (tenant_id, garage_id, text) VALUES ($1, $2, 'Row') RETURNING id
+         )
+         INSERT INTO board_message_lanes (tenant_id, message_id, lane_id)
+         SELECT $1, m.id, $3 FROM m
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+  },
+  {
+    table: 'walks',
+    // A person has one open walk at a garage, so each row is another person's.
+    insert: (c, t, w) =>
+      c.query(`INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:' || gen_random_uuid()) RETURNING id`, [t, w.garage]),
+  },
+  {
+    table: 'walk_sightings',
+    // A walk of its own and a typed plate on it.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH k AS (
+           INSERT INTO walks (tenant_id, garage_id, started_by) VALUES ($1, $2, 'key:' || gen_random_uuid()) RETURNING id
+         )
+         INSERT INTO walk_sightings (tenant_id, walk_id, read, plate, taken_at, added_by)
+         SELECT $1, k.id, 'typed', 'ROW1', now(), 'key:row' FROM k
+         RETURNING id`,
+        [t, w.garage],
+      ),
+    // Changed only by a pick, an answer or a picture forgotten; it goes with its walk -- the grant has no DELETE.
+    noDelete: true,
+  },
+  {
+    table: 'walk_stays',
+    // A walk of its own listing a stay of its own, as its finish does just before the walk is closed.
+    insert: (c, t, w) =>
+      c.query(
+        `WITH k AS (
+           INSERT INTO walks (tenant_id, garage_id, started_by)
+           VALUES ($1, $2, 'key:' || gen_random_uuid()) RETURNING id
+         ), v AS (
+           INSERT INTO vehicles (tenant_id, plate) VALUES ($1, 'WK-' || gen_random_uuid()) RETURNING id
+         ), s AS (
+           INSERT INTO sessions (tenant_id, garage_id, vehicle_id, entry_lane_id, entry_at, currency,
+                                 open_event_id, entry_confirmation)
+           SELECT $1, $2, v.id, $3, now() - interval '1 hour', 'USD', gen_random_uuid()::text, 'confirmed' FROM v
+           RETURNING id
+         )
+         INSERT INTO walk_stays (tenant_id, walk_id, session_id, list)
+         SELECT $1, k.id, s.id, 'seen' FROM k, s
+         RETURNING id`,
+        [t, w.garage, w.entryLane],
+      ),
+    // Written once at the finish and deleted with its walk: no UPDATE and no DELETE grant.
+    writeOnce: true,
+    noDelete: true,
+  },
+  {
+    table: 'lane_devices',
+    insert: (c, t, w) =>
+      c.query(
+        `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash)
+         VALUES ($1,$2,'Row', md5(gen_random_uuid()::text) || md5(gen_random_uuid()::text)) RETURNING id`,
+        [t, w.entryLane],
+      ),
+  },
+];
+
+/**
+ * Tables that legitimately have no tenant_id, and why.
+ *
+ * The guard requires every table in the schema to be either tenant-owned and
+ * protected, or named here. A table that is neither fails CI. Without this list
+ * the guard only inspects tables that already have a tenant_id -- so a new
+ * table that forgets the column entirely is invisible to it, which is the one
+ * case most worth catching. Measured before this existed: a `permits` table
+ * holding a plate, readable by every tenant, and the suite stayed green 7/7.
+ */
+export const TABLES_WITHOUT_TENANT_ID = {
+  schema_migrations: 'migration bookkeeping; global to the database by definition',
+  tenants: 'the tenant registry itself — scoped by its own id, not by a tenant_id column',
+  platform_security_log:
+    "refused attempts that name no account's garage and come with no account's credential (0026): nobody's, so " +
+    'no tenant; the application holds no grant on it and writes it only through record_refused_change()',
+  linked_sign_in_locks:
+    'wrong passwords for an email a linked accounts module keeps (0047): counted before anything says whose the email ' +
+    'is, and the module refuses without saying either, so no tenant; it holds a hash of the email and an address only',
+  passkey_challenges:
+    "passkey challenges (0047): a sign-in's is made before anything says who is signing in, so no tenant; an adding's " +
+    'names its admin and session only by a SHA-256 of them. Each holds a random challenge and the caller address, for five minutes',
+};
+
+/**
+ * Tables that are ENABLE ROW LEVEL SECURITY but deliberately NOT FORCE.
+ *
+ * ALL FIVE are credential-resolution tables, and they are on this list for the one
+ * reason the RLS template cannot express: a credential is presented and the
+ * tenant that owns it is precisely what the lookup exists to discover, so no
+ * tenant policy can gate it. Nothing else may join this list without the same
+ * argument.
+ * See migration 0002 for why lane_devices is the exception, 0003 for
+ * operator_tokens, 0024 for operator_users (an email is presented and its
+ * tenant is what the lookup finds), and rls-coverage.test.js for the assertion
+ * that these are the ONLY ones. 0024's other table, operator_sign_in_locks, is
+ * read only once the tenant is known, and is FORCED like any other. 0047 adds
+ * operator_passkeys (a passkey is presented; its tenant is what the lookup
+ * finds) and linked_sessions (a session token, as operator_tokens).
+ */
+export const NOT_FORCED_BY_DESIGN = ['lane_devices', 'linked_sessions', 'operator_passkeys', 'operator_tokens', 'operator_users'];

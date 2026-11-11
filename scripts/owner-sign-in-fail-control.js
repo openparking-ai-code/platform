@@ -1,0 +1,838 @@
+#!/usr/bin/env node
+/**
+ * The control for the owner's sign-in (0024).
+ *
+ * Every property sign-in rests on is broken below, one at a time, and the
+ * suite named beside it is REQUIRED to go red. A pass is the failure.
+ *
+ * SOURCE breaks, applied to a COPY of the tree; no tracked file is edited.
+ * Each anchor must occur exactly once in its file, or the break is reported as
+ * not planted rather than run:
+ *   mounted_after_operator   the auth routes are mounted after the operator router.
+ *   token_logged             a minted session token is written to the log.
+ *   message_logged           a failure inside sign-in is logged by its message.
+ *   parser_text_answered     an unreadable body is answered with the parser's text.
+ *   query_read               sign-in reads a credential from the query.
+ *   dummy_skipped            an unknown email runs no hash.
+ *   lock_off_by_one          the tenth wrong password does not lock.
+ *   lock_whole_account       a lock on one address locks every address.
+ *   address_from_header      the caller address is read from X-Forwarded-For, untrusted.
+ *   idle_unchecked           a session never ends for being idle.
+ *   sign_out_keeps_session   sign-out does not revoke the session.
+ *   reset_keeps_sessions     a password reset leaves the admin's sessions live.
+ *   reset_keeps_locks        a password reset leaves the locks in place.
+ *   httponly_dropped         the cookie is readable by page script.
+ *   secure_dropped           the cookie is sent without Secure by default.
+ *   origin_unchecked         a cookie-authenticated change from any Origin is accepted.
+ *   password_argument_taken  a password on the command line is accepted.
+ *   no_store_dropped         operator responses may be stored.
+ *   short_password_taken     the length rule is not enforced.
+ *   refusal_floor_dropped    a refusal is answered as soon as its work is done (F1).
+ *   unknown_skips_lock_read  an unknown email skips the lock lookup (F1).
+ *   unknown_skips_failure_write  an unknown email skips the failure write (F1).
+ *   hash_line_uncapped       the hash line has no length and no per-address share (F5).
+ *   auth_body_failure_500    a sign-in body that cannot be read is a 500 (F4).
+ *   auth_parser_router_wide  every path under /auth reads a body, so a non-route is not a 404 (F4).
+ *   operator_parser_text     an operator body that cannot be read is answered in the parser's words (F3).
+ *   operator_parse_headers_dropped  that answer may be stored and sniffed (F3).
+ *   number_setting_unchecked a number setting is taken whatever it is (F6).
+ *   hop_count_unbounded      TRUST_PROXY may name any number of hops (F6).
+ *   password_file_mode_ignored  a password file others can read is taken (F7).
+ *   refusal_echoes_argument  a refused option is repeated back, password and all (F7).
+ *   no_origin_signs_in       with no ADMIN_ORIGIN, sign-in is on (decision 1).
+ *   foreign_origin_signs_in  a sign-in from a foreign Origin is taken (decision 2).
+ *   cookie_twice_first_taken a cookie sent twice is read as its first value (decision 4).
+ *   ended_sessions_kept      a sign-in leaves the admin's ended sessions in place (decision 6).
+ *   id_unchecked             an id that is not a uuid reaches the handler and the database (C3).
+ *   unknown_garage_lane_500  a lane added to a garage that is not there is a database error (C3).
+ *   unknown_lane_device_500  a device added to a lane that is not there is a database error (C3).
+ *   body_check_by_path_case  an unreadable body is answered in one sentence only on the lower-case path (R1).
+ *   decoy_after_listen       the port opens before the decoy hash is finished (R2).
+ *   start_settings_unchecked PORT, PG_POOL_MAX and MAX_CLOCK_SKEW_SECONDS are not checked at start (R4).
+ *   password_file_writable_taken  a password file others can write is taken (R6).
+ *   password_folder_writable_taken  a password file in a folder others can write is taken.
+ *   lock_count_never_restarts  after a lock ends the count goes on, so one wrong password locks again.
+ *   minted_after_password_change  a sign-in that checked the old password gets a session after the change.
+ *   user_row_not_held        the hash is read again but the row is not held, so a change lands before the session.
+ *   key_me_off               /me does not answer an operator key.
+ *   key_me_says_more         /me answers an operator key with more than its kind and tenant.
+ *   key_me_cookie_first      /me reads the cookie before a Bearer header.
+ *   key_me_not_touched       /me does not record an operator key's last use.
+ *
+ * SCHEMA breaks build a SCRATCH DATABASE from a copy of `migrations/` with a
+ * statement edited out of 0024, so the property genuinely never existed:
+ *   absolute_unchecked       a session past its absolute end is still found.
+ *   session_is_a_key         a session token is accepted as a Bearer key.
+ *   public_execute_restored  resolve_operator_user is executable by PUBLIC again (F2).
+ *   session_outlives_password_change  a session from before a password change is still found.
+ *   hash_change_moves_no_time  a change of the hash alone leaves password_changed_at, so sessions live on.
+ *
+ * Needs the same environment as the suite.
+ *
+ * SHARDS. Every suite-runs-intact check and every break above is one ITEM. With
+ * no argument all items run, in order, as they always have. CI spreads them
+ * over parallel jobs, each with its own database, and then proves the spread
+ * left nothing out:
+ *   --plan               print every item's name, one per line
+ *   --shard i/N          run the items of shard i of N; write what ran and what
+ *                        failed to sign-in-control-shard-<i>.json
+ *   --verify <dir>       read the shard files in <dir>: shards 1..N each exactly
+ *                        once, every item of the plan run exactly once and none
+ *                        else, no control failed -- or exit 1, naming what is wrong
+ * Which shard an item lands in is chosen by a rough cost (a run of the sign-in
+ * suite takes about a minute on CI, the others seconds) so the shards end
+ * together. The cost only balances; it never decides whether an item runs.
+ */
+import { spawnSync } from 'node:child_process';
+import {
+  copyFileSync, cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import pg from 'pg';
+
+const ROOT = resolve(import.meta.dirname, '..');
+const SCRATCH = process.env.SIGN_IN_SCRATCH_DB || 'openparking_sign_in_control';
+
+const SIGN_IN = ['test/owner-sign-in.test.js'];
+const CLI = ['test/admin-cli.test.js'];
+const OUTPUT = ['test/owner-sign-in-output.test.js'];
+const DEFINERS = ['test/definer-grants.test.js'];
+const IDS = ['test/ids.test.js'];
+const COLD_START = ['test/sign-in-cold-start.test.js'];
+const START = ['test/start-settings.test.js'];
+
+const SOURCE_BREAKS = [
+  {
+    name: 'mounted_after_operator',
+    why: 'the auth routes are mounted after the operator router',
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: "  app.use('/api/v1/auth', signIn.createAuthRouter(authSettings));\n",
+    to: '',
+    also: [{ file: 'src/app.js', from: "  app.use('/api/v1', operator);\n", to: "  app.use('/api/v1', operator);\n  app.use('/api/v1/auth', signIn.createAuthRouter(authSettings));\n" }],
+  },
+  {
+    name: 'token_logged',
+    why: 'a minted session token is written to the log',
+    suite: OUTPUT,
+    file: 'src/signIn.js',
+    from: '    const token = generateDeviceToken();\n',
+    to: "    const token = generateDeviceToken();\n    console.log('[auth] minted', token);\n",
+  },
+  {
+    name: 'message_logged',
+    why: 'a failure inside sign-in is logged by its message',
+    suite: [...SIGN_IN, ...OUTPUT],
+    file: 'src/signIn.js',
+    from: "  console.error(`[auth] ${where} failed: ${kind}${err?.code ? ` ${err.code}` : ''}`);",
+    to: "  console.error(`[auth] ${where} failed: ${kind}${err?.code ? ` ${err.code}` : ''}: ${err?.message}`);",
+  },
+  {
+    name: 'parser_text_answered',
+    why: "an unreadable body is answered with the parser's text",
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);\n    if (err?.passkeyUnreadable) {',
+    to: '    if (err?.unreadable) return refuse(req, res, 400, { error: err.cause?.message, code: UNREADABLE.code });\n    if (err?.passkeyUnreadable) {',
+  },
+  {
+    name: 'query_read',
+    why: 'sign-in reads a credential from the query',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      const body = signInBody(req.body);\n',
+    to: '      const body = signInBody(req.query.token ? { email: req.query.email, password: req.query.password } : req.body);\n',
+  },
+  {
+    name: 'dummy_skipped',
+    why: 'an unknown email runs no hash',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      const matches = await internals.verifyPassword(body.password, found ? found.password_hash : await dummyHash());\n',
+    to: '      const matches = found ? await internals.verifyPassword(body.password, found.password_hash) : false;\n',
+  },
+  {
+    name: 'lock_off_by_one',
+    why: 'the tenth wrong password does not lock',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '        [user.tenant_id, user.user_id, address, MAX_FAILED, LOCK_MINUTES, counted],',
+    to: '        [user.tenant_id, user.user_id, address, MAX_FAILED + 1, LOCK_MINUTES, counted],',
+  },
+  {
+    name: 'lock_whole_account',
+    why: 'a lock on one address locks every address',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "'SELECT failed_count, locked_until FROM operator_sign_in_locks WHERE user_id = $1 AND address = $2', [user.user_id, address]",
+    to: "'SELECT failed_count, locked_until FROM operator_sign_in_locks WHERE user_id = $1 AND $2::text IS NOT NULL ORDER BY locked_until DESC NULLS LAST LIMIT 1', [user.user_id, address]",
+  },
+  {
+    name: 'address_from_header',
+    why: 'the caller address is read from X-Forwarded-For with no trusted proxy',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "  let address = (settings.trustProxy === null ? req.socket.remoteAddress : req.ip) ?? 'unknown';",
+    to: "  let address = (req.get?.('x-forwarded-for') ?? (settings.trustProxy === null ? req.socket.remoteAddress : req.ip)) ?? 'unknown';",
+  },
+  {
+    name: 'idle_unchecked',
+    why: 'a session never ends for being idle',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "'SELECT * FROM resolve_operator_session($1, $2)', [hashToken(token), settings.idleSeconds]",
+    to: "'SELECT * FROM resolve_operator_session($1, $2)', [hashToken(token), 10 ** 8]",
+  },
+  {
+    name: 'sign_out_keeps_session',
+    why: 'sign-out does not revoke the session',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "c.query('UPDATE operator_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL', [req.session.token_id])",
+    to: "c.query('SELECT $1::uuid', [req.session.token_id])",
+  },
+  {
+    name: 'reset_keeps_sessions',
+    why: "a password reset leaves the admin's sessions live",
+    suite: [...SIGN_IN, ...CLI],
+    file: 'src/adminAccount.js',
+    from: "`UPDATE operator_tokens SET revoked_at = now() WHERE user_id = $1 AND kind = 'session' AND revoked_at IS NULL`",
+    to: "`SELECT 1 WHERE $1::uuid IS NULL`",
+  },
+  {
+    name: 'reset_keeps_locks',
+    why: 'a password reset leaves the locks in place',
+    suite: [...SIGN_IN, ...CLI],
+    file: 'src/adminAccount.js',
+    from: "c.query('DELETE FROM operator_sign_in_locks WHERE user_id = $1', [user.user_id])",
+    to: "c.query('SELECT 1 WHERE $1::uuid IS NULL', [user.user_id])",
+  },
+  {
+    name: 'httponly_dropped',
+    why: 'the cookie is readable by page script',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '  return `Path=${path}; HttpOnly; SameSite=Strict;',
+    to: '  return `Path=${path}; SameSite=Strict;',
+  },
+  {
+    name: 'cookie_path_api',
+    why: 'the cookie is set at Path=/api, so the owner pages beside the admin never receive it',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "function cookieAttributes(settings, maxAge, path = '/') {",
+    to: "function cookieAttributes(settings, maxAge, path = '/api') {",
+  },
+  {
+    name: 'legacy_cookie_kept',
+    why: 'the Path=/api cookie of an earlier version is not removed, so a browser sends op_session twice',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "  res.append('Set-Cookie', `${COOKIE}=; ${cookieAttributes(settings, 0, '/api')}`);",
+    to: "  void res;",
+  },
+  {
+    name: 'powered_by_shown',
+    why: 'every answer names the framework in X-Powered-By',
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: "  app.disable('x-powered-by');\n",
+    to: "",
+  },
+  {
+    name: 'secure_dropped',
+    why: 'the cookie is sent without Secure by default',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "${settings.cookieSecure ? '; Secure' : ''}",
+    to: '',
+  },
+  {
+    name: 'origin_unchecked',
+    why: 'a cookie-authenticated change from any Origin is accepted',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '  if (SAFE_METHODS.has(req.method)) return true;\n',
+    to: '  if (SAFE_METHODS.has(req.method) || req) return true;\n',
+  },
+  {
+    name: 'password_argument_taken',
+    why: 'a password on the command line is accepted',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '      throw new AdminCommandRefused(PASSWORD_ARGUMENT);\n',
+    to: "      out.password = argv[(i += 1)] ?? arg.split('=')[1];\n      continue;\n",
+  },
+  {
+    name: 'no_store_dropped',
+    why: 'operator responses may be stored',
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: '  operator.use(signIn.noStore);\n',
+    to: '',
+  },
+  {
+    name: 'short_password_taken',
+    why: 'the length rule is not enforced',
+    suite: CLI,
+    file: 'src/passwords.js',
+    from: '  if (length < MIN_PASSWORD_LENGTH) return',
+    to: '  if (length < 1) return',
+  },
+  {
+    name: 'refusal_floor_dropped',
+    why: 'a refusal is answered as soon as its work is done',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '    if (wait > 0) await sleep(wait);\n',
+    to: '',
+  },
+  {
+    name: 'unknown_skips_lock_read',
+    why: 'an unknown email skips the lock lookup',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      const lock = await internals.lockOf(user, address);\n',
+    to: '      const lock = found ? await internals.lockOf(user, address) : null;\n',
+  },
+  {
+    name: 'unknown_skips_failure_write',
+    why: 'an unknown email skips the failure write',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '        await internals.recordFailure(user, address, Boolean(found) && !matches);\n',
+    to: '        if (found) await internals.recordFailure(user, address, Boolean(found) && !matches);\n',
+  },
+  {
+    name: 'hash_line_uncapped',
+    why: 'the hash line has no length and no per-address share',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (held >= max || mine >= perAddress) return null;\n',
+    to: '      if (held < 0 || mine < 0) return null;\n',
+  },
+  {
+    name: 'auth_body_failure_500',
+    why: 'a sign-in body that cannot be read is a 500',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '    if (err?.unreadable) return refuse(req, res, 400, UNREADABLE);\n',
+    to: '',
+  },
+  {
+    name: 'auth_parser_router_wide',
+    why: 'every path under /auth reads a body, so a non-route is not a 404',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '  router.use(noStore);\n\n  router.post(',
+    to: '  router.use(noStore);\n  router.use(readSignInBody);\n\n  router.post(',
+  },
+  {
+    name: 'operator_parser_text',
+    why: "an operator body that cannot be read is answered in the parser's words",
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: ': res.status(400).json(BODY_UNREADABLE);',
+    to: ': res.status(400).json({ error: err.message });',
+  },
+  {
+    name: 'operator_parse_headers_dropped',
+    why: 'an operator body that cannot be read is answered without no-store and nosniff',
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: "      res.set('Cache-Control', 'no-store');\n      res.set('X-Content-Type-Options', 'nosniff');\n      return err.status === 413",
+    to: '      return err.status === 413',
+  },
+  {
+    name: 'number_setting_unchecked',
+    why: 'a number setting is taken whatever it is',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '  if (!/^[0-9]{1,6}$/.test(raw) || Number(raw) < min || Number(raw) > max) {\n',
+    to: '  if (Number.isNaN(Number(raw))) {\n',
+  },
+  {
+    name: 'hop_count_unbounded',
+    why: 'TRUST_PROXY may name any number of hops',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '    if (value < 1 || value > MAX_PROXY_HOPS) throw',
+    to: '    if (value < 0) throw',
+  },
+  {
+    name: 'password_file_mode_ignored',
+    why: 'a password file others can read is taken',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '    if (mode & 0o044) {\n',
+    to: '    if (mode & 0) {\n',
+  },
+  {
+    name: 'refusal_echoes_argument',
+    why: 'a refused option is repeated back, password and all',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '`an unknown option (not repeated here: it may hold a password); this command takes',
+    to: '`unknown option ${name}; this command takes',
+  },
+  {
+    name: 'no_origin_signs_in',
+    why: 'with no ADMIN_ORIGIN, sign-in is on',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (settings.adminOrigin === null) return await refuse(req, res, 409, NOT_CONFIGURED);\n',
+    to: '',
+  },
+  {
+    name: 'foreign_origin_signs_in',
+    why: 'a sign-in from a foreign Origin is taken',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (origin !== undefined && origin !== settings.adminOrigin) return await refuse(req, res, 403, ORIGIN_REFUSED);\n',
+    to: '',
+  },
+  {
+    name: 'cookie_twice_first_taken',
+    why: 'a cookie sent twice is read as its first value',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '  if (values.length !== 1 || ',
+    to: '  if (values.length < 1 || ',
+  },
+  {
+    name: 'ended_sessions_kept',
+    why: "a sign-in leaves the admin's ended sessions in place",
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "        `DELETE FROM operator_tokens WHERE user_id = $1 AND kind = 'session'\n",
+    to: "        `SELECT 1 FROM operator_tokens WHERE user_id = $1 AND kind = 'session'\n",
+  },
+  {
+    name: 'id_unchecked',
+    why: 'an id that is not a uuid reaches the handler and the database',
+    suite: IDS,
+    file: 'src/app.js',
+    from: '    router.param(name, (req, _res, next, value) => next(shape.test(value) ? undefined : Object.assign(notFound(req.route.path), { malformedId: true })));\n',
+    to: '    router.param(name, (_req, _res, next) => next());\n',
+  },
+  {
+    name: 'unknown_garage_lane_500',
+    why: 'a lane added to a garage that is not there is a database error',
+    suite: IDS,
+    file: 'src/app.js',
+    from: "        if (!(await repo.getGarage(client, req.tenantId, req.params.garageId))) throw new HttpError(404, 'garage not found');\n",
+    to: '',
+  },
+  {
+    name: 'unknown_lane_device_500',
+    why: 'a device added to a lane that is not there is a database error',
+    suite: IDS,
+    file: 'src/app.js',
+    from: "        if (lane.rowCount === 0) throw new HttpError(404, 'lane not found');\n",
+    to: '',
+  },
+  {
+    name: 'body_check_by_path_case',
+    why: 'an unreadable body is answered in one sentence only on the lower-case path',
+    suite: SIGN_IN,
+    file: 'src/app.js',
+    from: '    if (err.bodyUnreadable) {\n',
+    to: "    if (err.bodyUnreadable && req.path.startsWith('/api/v1/') && !req.path.startsWith('/api/v1/lane/')) {\n",
+  },
+  {
+    name: 'decoy_after_listen',
+    why: 'the port opens before the decoy hash is finished',
+    suite: COLD_START,
+    file: 'src/server.js',
+    from: '  await dummyHash();\n',
+    to: '  void dummyHash;\n',
+  },
+  {
+    name: 'start_settings_unchecked',
+    why: 'PORT, PG_POOL_MAX and MAX_CLOCK_SKEW_SECONDS are not checked at start',
+    suite: START,
+    file: 'src/server.js',
+    from: '  ({ PORT: port } = assertStartSettings());\n',
+    to: '  port = Number(process.env.PORT || 3000);\n',
+  },
+  {
+    name: 'password_file_writable_taken',
+    why: 'a password file others can write is taken',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '    if (mode & 0o022) {\n',
+    to: '    if (mode & 0) {\n',
+  },
+  {
+    name: 'password_folder_writable_taken',
+    why: 'a password file in a folder others can write is taken',
+    suite: CLI,
+    file: 'src/adminAccount.js',
+    from: '      if (folder & 0o022 && !(folder & 0o1000)) {\n',
+    to: '      if (folder & 0) {\n',
+  },
+  {
+    name: 'lock_count_never_restarts',
+    why: 'after a lock ends the count goes on, so one wrong password locks again',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '           failed_count = CASE WHEN l.locked_until <= now() THEN 1 ELSE l.failed_count + 1 END,\n' +
+      '           locked_until = CASE\n' +
+      '             WHEN (CASE WHEN l.locked_until <= now() THEN 1 ELSE l.failed_count + 1 END) >= $4 THEN now() + make_interval(mins => $5)\n' +
+      '             WHEN l.locked_until <= now() THEN NULL\n' +
+      '             ELSE l.locked_until END,\n',
+    to: '           failed_count = l.failed_count + 1,\n' +
+      '           locked_until = CASE WHEN l.failed_count + 1 >= $4 THEN now() + make_interval(mins => $5) ELSE l.locked_until END,\n',
+  },
+  {
+    name: 'minted_after_password_change',
+    why: 'a sign-in that checked the old password gets a session after the change',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: '      if (still.rowCount !== 1) return null;\n',
+    to: '',
+  },
+  {
+    name: 'user_row_not_held',
+    why: 'the hash is read again but the row is not held, so a change lands before the session',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: ' AND password_hash = $2 FOR SHARE\'',
+    to: ' AND password_hash = $2\'',
+  },  {
+    name: 'key_me_off',
+    why: '/me does not answer an operator key',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "  router.get('/me', keyAsks, session, ",
+    to: "  router.get('/me', session, ",
+  },
+  {
+    name: 'key_me_says_more',
+    why: '/me answers an operator key with more than its kind and tenant',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "      return res.json({ kind: 'key', tenant_id: rows[0].tenant_id });\n",
+    to: "      return res.json({ kind: 'key', tenant_id: rows[0].tenant_id, token_id: rows[0].token_id });\n",
+  },
+  {
+    name: 'key_me_cookie_first',
+    why: '/me reads the cookie before a Bearer header',
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "    const token = bearerFrom(req.get('authorization'));\n    if (token === null) return next();\n",
+    to: "    const token = bearerFrom(req.get('authorization'));\n    if (token === null || sessionToken(req) !== null) return next();\n",
+  },
+  {
+    name: 'key_me_not_touched',
+    why: "/me does not record an operator key's last use",
+    suite: SIGN_IN,
+    file: 'src/signIn.js',
+    from: "      query('SELECT touch_operator_token($1)', [rows[0].token_id]).catch(() => {});\n",
+    to: '',
+  },
+];
+
+const SCHEMA_BREAKS = [
+  {
+    name: 'absolute_unchecked',
+    why: 'a session past its absolute end is still found',
+    suite: SIGN_IN,
+    edits: [{ file: '0024_operator_sign_in.sql', from: "         AND t.expires_at > now()\n", to: '' }],
+  },
+  {
+    name: 'session_is_a_key',
+    why: 'a session token is accepted as a Bearer key',
+    suite: SIGN_IN,
+    edits: [{ file: '0024_operator_sign_in.sql', from: "      AND t.kind = 'key'\n", to: '' }],
+  },
+  {
+    name: 'public_execute_restored',
+    why: 'resolve_operator_user is executable by PUBLIC again',
+    suite: DEFINERS,
+    edits: [{ file: '0024_operator_sign_in.sql', from: 'REVOKE EXECUTE ON FUNCTION resolve_operator_user(text) FROM PUBLIC;\n', to: '' }],
+  },
+  {
+    name: 'session_outlives_password_change',
+    why: 'a session from before a password change is still found',
+    suite: SIGN_IN,
+    edits: [{ file: '0024_operator_sign_in.sql', from: '         AND t.created_at >= u.password_changed_at\n', to: '' }],
+  },
+  {
+    name: 'hash_change_moves_no_time',
+    why: 'a change of the hash alone leaves password_changed_at, so sessions live on',
+    suite: SIGN_IN,
+    edits: [{
+      file: '0024_operator_sign_in.sql',
+      from: 'CREATE TRIGGER operator_users_password_changed\n' +
+        '  BEFORE UPDATE OF password_hash ON operator_users\n' +
+        '  FOR EACH ROW\n' +
+        '  WHEN (NEW.password_hash IS DISTINCT FROM OLD.password_hash)\n' +
+        '  EXECUTE FUNCTION operator_users_password_changed();\n',
+      to: '',
+    }],
+  },
+];
+
+const CONTROL_A_SUITES = [SIGN_IN, CLI, OUTPUT, DEFINERS, IDS, COLD_START, START];
+
+//: Every item, in the order a full run takes them.
+const ITEMS = [
+  ...CONTROL_A_SUITES.map((suite) => ({ kind: 'intact', name: `intact ${suite.join(' ')}`, suite })),
+  ...SOURCE_BREAKS.map((brk) => ({ kind: 'source', name: brk.name, brk })),
+  ...SCHEMA_BREAKS.map((brk) => ({ kind: 'schema', name: brk.name, brk })),
+];
+
+/** Roughly how long an item takes on CI, in seconds: for balancing the shards, nothing else. */
+function cost(item) {
+  const suite = item.kind === 'intact' ? item.suite : item.brk.suite;
+  return suite.some((f) => SIGN_IN.includes(f) || OUTPUT.includes(f)) ? 65 : 5;
+}
+
+/** The items of shard `i` of `n`: longest first, each to the shard with the least so far. */
+function shardOf(i, n) {
+  const load = Array(n).fill(0);
+  const mine = new Set();
+  const order = ITEMS.map((item, at) => ({ item, at })).sort((a, b) => cost(b.item) - cost(a.item) || a.at - b.at);
+  for (const { item, at } of order) {
+    const k = load.indexOf(Math.min(...load));
+    load[k] += cost(item);
+    if (k === i - 1) mine.add(at);
+  }
+  return ITEMS.filter((_, at) => mine.has(at));
+}
+
+const [mode, modeArg] = process.argv.slice(2);
+if (mode !== undefined && !['--plan', '--shard', '--verify'].includes(mode)) {
+  console.error(`unknown argument ${JSON.stringify(mode)}: --plan, --shard i/N, --verify <dir>, or nothing`);
+  process.exit(2);
+}
+if (new Set(ITEMS.map((item) => item.name)).size !== ITEMS.length) {
+  console.error('two items share a name; a shard report could not tell them apart');
+  process.exit(2);
+}
+if (mode === '--plan') {
+  for (const item of ITEMS) console.log(item.name);
+  process.exit(0);
+}
+if (mode === '--verify') {
+  const dir = modeArg;
+  const files = dir ? readdirSync(dir).filter((f) => /^sign-in-control-shard-\d+\.json$/.test(f)) : [];
+  const reports = files.map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')));
+  const wrong = [];
+  const of = new Set(reports.map((r) => r.of));
+  if (reports.length === 0) wrong.push(`no shard report in ${dir}`);
+  if (of.size > 1) wrong.push(`shard reports disagree on the shard count: ${[...of].join(', ')}`);
+  const n = [...of][0];
+  for (let i = 1; i <= n; i += 1) {
+    const count = reports.filter((r) => r.shard === i).length;
+    if (count !== 1) wrong.push(`shard ${i}/${n} reported ${count} times`);
+  }
+  for (const r of reports) if (!(r.shard >= 1 && r.shard <= n)) wrong.push(`a report from shard ${r.shard} of ${n}`);
+  const ran = reports.flatMap((r) => r.ran);
+  for (const item of ITEMS) {
+    const times = ran.filter((name) => name === item.name).length;
+    if (times !== 1) wrong.push(`${item.name} ran ${times} times`);
+  }
+  for (const name of new Set(ran)) if (!ITEMS.some((item) => item.name === name)) wrong.push(`${name} ran but is not in the plan`);
+  for (const r of reports) if (r.failures !== 0) wrong.push(`shard ${r.shard}/${r.of}: ${r.failures} control(s) failed`);
+  if (wrong.length) {
+    for (const w of wrong) console.error(`  ${w}`);
+    console.error(`\nthe sign-in control's shards do not add up to one whole run (${wrong.length} problem(s)).`);
+    process.exit(1);
+  }
+  console.log(`all ${ITEMS.length} items ran exactly once over ${n} shards, every control OK.`);
+  process.exit(0);
+}
+let shard = null;
+if (mode === '--shard') {
+  const m = /^([0-9]{1,2})\/([0-9]{1,2})$/.exec(modeArg ?? '');
+  if (!m || Number(m[1]) < 1 || Number(m[1]) > Number(m[2])) {
+    console.error(`--shard takes i/N with 1 <= i <= N, not ${JSON.stringify(modeArg)}`);
+    process.exit(2);
+  }
+  shard = { i: Number(m[1]), n: Number(m[2]) };
+}
+const RUN = shard ? shardOf(shard.i, shard.n) : ITEMS;
+
+function stage() {
+  const dir = mkdtempSync(join(tmpdir(), 'openparking-sign-in-control-'));
+  for (const entry of ['src', 'test', 'scripts', 'migrations', 'package.json']) {
+    cpSync(join(ROOT, entry), join(dir, entry), { recursive: true });
+  }
+  symlinkSync(join(ROOT, 'node_modules'), join(dir, 'node_modules'), 'dir');
+  return dir;
+}
+
+function run(dir, suite, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv };
+  delete env.NODE_TEST_CONTEXT;
+  return spawnSync(process.execPath, ['--test', ...suite], { cwd: dir, env, stdio: 'pipe', encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+}
+
+function summarise(result) {
+  const line = (label) => {
+    const match = result.stdout.match(new RegExp(`^[ℹ#] ${label} (\\d+)\\s*$`, 'm'));
+    return match ? match[1] : '?';
+  };
+  return `${line('pass')} passed, ${line('fail')} failed`;
+}
+
+/** A break and its `also` edits, every one or none: each anchor exactly once. */
+function plant(dir, edit) {
+  const planned = new Map();
+  for (const e of [edit, ...(edit.also ?? [])]) {
+    const path = join(dir, e.file);
+    const source = planned.get(path) ?? readFileSync(path, 'utf8');
+    if (source.split(e.from).length !== 2) return false;
+    planned.set(path, source.replace(e.from, () => e.to));
+  }
+  for (const [path, text] of planned) writeFileSync(path, text);
+  return true;
+}
+
+function required(name) {
+  const value = process.env[name];
+  if (!value) {
+    console.error(`${name} is required`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const adminUrl = required('DATABASE_URL');
+const appPassword = required('APP_DB_PASSWORD');
+const host = new URL(adminUrl).host;
+const scratchAdmin = new URL(adminUrl);
+scratchAdmin.pathname = `/${SCRATCH}`;
+const scratchApp = new URL(`postgres://openparking_app@${host}/${SCRATCH}`);
+scratchApp.password = appPassword;
+const maintenance = new URL(required('SUPERUSER_URL'));
+maintenance.pathname = '/postgres';
+const scratchEnv = { DATABASE_URL: scratchAdmin.toString(), APP_DATABASE_URL: scratchApp.toString() };
+
+async function withAdmin(url, fn) {
+  const client = new pg.Client({ connectionString: url });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.end();
+  }
+}
+
+/** A scratch database built from `migrations/` with one statement edited out. */
+async function buildScratch(dir, brk) {
+  await withAdmin(maintenance.toString(), async (c) => {
+    await c.query(`DROP DATABASE IF EXISTS ${pg.escapeIdentifier(SCRATCH)}`);
+  });
+  const partial = mkdtempSync(join(tmpdir(), 'openparking-sign-in-migrations-'));
+  for (const file of readdirSync(join(ROOT, 'migrations')).filter((f) => f.endsWith('.sql'))) {
+    copyFileSync(join(ROOT, 'migrations', file), join(partial, file));
+  }
+  for (const edit of brk.edits) {
+    const path = join(partial, edit.file);
+    const sql = readFileSync(path, 'utf8');
+    if (sql.split(edit.from).length !== 2) {
+      rmSync(partial, { recursive: true, force: true });
+      return { ok: false, where: edit.file };
+    }
+    writeFileSync(path, sql.replace(edit.from, () => edit.to));
+  }
+  for (const [script, extra] of [
+    ['scripts/prepare-database.js', { MIGRATIONS_DIR: partial }],
+    ['scripts/migrate.js', { MIGRATIONS_DIR: partial }],
+  ]) {
+    const result = spawnSync(process.execPath, [script], { cwd: dir, env: { ...process.env, ...scratchEnv, ...extra }, encoding: 'utf8' });
+    if (result.status !== 0) {
+      console.error(result.stdout, result.stderr);
+      throw new Error(`${script} failed against the scratch database`);
+    }
+  }
+  rmSync(partial, { recursive: true, force: true });
+  return { ok: true };
+}
+
+let failures = 0;
+const ran = [];
+const report = (brk, broken) => {
+  if (broken.status === 0) {
+    console.error(`  ${brk.name.padEnd(24)} *** PASSED WHEN ${brk.why.toUpperCase()} — the suite is not measuring this ***`);
+    failures += 1;
+  } else {
+    console.log(`  ${brk.name.padEnd(24)} fails as required when ${brk.why} — ${summarise(broken)}`);
+  }
+};
+
+if (shard) console.log(`== shard ${shard.i} of ${shard.n}: ${RUN.length} of ${ITEMS.length} items ==\n`);
+
+const intact = RUN.filter((item) => item.kind === 'intact');
+if (intact.length) {
+  const intactDir = stage();
+  try {
+    console.log('== control A: the suites must PASS intact ==');
+    for (const { name, suite } of intact) {
+      ran.push(name);
+      const result = run(intactDir, suite);
+      if (result.status === 0) {
+        console.log(`  control A OK — ${suite.join(' ')}: ${summarise(result)}`);
+      } else {
+        console.error(`  CONTROL A FAILED — ${suite.join(' ')} does not pass even intact: ${summarise(result)}`);
+        console.error(result.stdout.slice(-4000));
+        console.error(result.stderr.slice(-4000));
+        failures += 1;
+      }
+    }
+  } finally {
+    rmSync(intactDir, { recursive: true, force: true });
+  }
+}
+
+const sources = RUN.filter((item) => item.kind === 'source');
+if (sources.length) console.log('\n== control B: each SOURCE break must make it FAIL ==');
+for (const { brk } of sources) {
+  ran.push(brk.name);
+  const dir = stage();
+  try {
+    if (!plant(dir, brk)) {
+      console.error(`  ${brk.name.padEnd(24)} *** ANCHOR NOT FOUND EXACTLY ONCE in ${brk.file} ***`);
+      failures += 1;
+      continue;
+    }
+    report(brk, run(dir, brk.suite));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const schemas = RUN.filter((item) => item.kind === 'schema');
+if (schemas.length) console.log('\n== control C: each SCHEMA break must make it FAIL ==');
+for (const { brk } of schemas) {
+  ran.push(brk.name);
+  const dir = stage();
+  try {
+    const built = await buildScratch(dir, brk);
+    if (!built.ok) {
+      console.error(`  ${brk.name.padEnd(24)} *** ANCHOR NOT FOUND EXACTLY ONCE in ${built.where} ***`);
+      failures += 1;
+      continue;
+    }
+    report(brk, run(dir, brk.suite, scratchEnv));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+if (schemas.length) await withAdmin(maintenance.toString(), (c) => c.query(`DROP DATABASE IF EXISTS ${pg.escapeIdentifier(SCRATCH)}`));
+
+if (shard) {
+  writeFileSync(`sign-in-control-shard-${shard.i}.json`, `${JSON.stringify({ shard: shard.i, of: shard.n, ran, failures })}\n`);
+}
+if (failures) {
+  console.error(`\n${failures} control(s) failed. Do not trust this round's sign-in tests.`);
+  process.exit(1);
+}
+console.log(shard
+  ? `\nshard ${shard.i} of ${shard.n}: all ${ran.length} controls OK.`
+  : '\nall controls OK — the suites fail on every property owner sign-in rests on.');

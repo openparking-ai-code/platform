@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.local
+coverage/
+*.log
+.DS_Store
+.demo-credentials.json

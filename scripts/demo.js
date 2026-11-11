@@ -1,0 +1,156 @@
+#!/usr/bin/env node
+/**
+ * One command: database, schema, app role, demo garage, running server.
+ *
+ * Writes .demo-credentials.json (gitignored) so the lane controller in the
+ * sibling repository can pick up the device tokens without anyone copying a
+ * secret between two terminals.
+ */
+import { chmodSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { createApp } from '../src/app.js';
+import { withTenant, pool } from '../src/db.js';
+import { generateDeviceToken, hashToken } from '../src/auth.js';
+
+if (!process.env.SUPERUSER_URL || !process.env.DATABASE_URL || !process.env.APP_DB_PASSWORD || !process.env.APP_DATABASE_URL) {
+  console.error('SUPERUSER_URL, DATABASE_URL, APP_DATABASE_URL and APP_DB_PASSWORD are required (copy .env.example)');
+  process.exit(1);
+}
+
+// 1 and 2. database, owner, app role and schema: the one superuser step, then
+// every other migration as the owner
+for (const script of ['scripts/prepare-database.js', 'scripts/migrate.js']) {
+  const r = spawnSync(process.execPath, [script], { stdio: 'inherit' });
+  if (r.status !== 0) process.exit(r.status ?? 1);
+}
+
+// 3. a garage with two lanes, a flat plan, activated, and a device on each lane
+const tenantId = randomUUID();
+await withTenant(tenantId, (c) =>
+  c.query('INSERT INTO tenants (id, slug, name) VALUES ($1,$2,$3)', [
+    tenantId,
+    `demo-${tenantId.slice(0, 8)}`,
+    'Demo Operator',
+  ]),
+);
+
+const entryToken = generateDeviceToken();
+const exitToken = generateDeviceToken();
+const operatorTokenValue = generateDeviceToken();
+
+const demo = await withTenant(tenantId, async (c) => {
+  const garage = (
+    await c.query(
+      `INSERT INTO garages (tenant_id, name, timezone, currency)
+       VALUES ($1,'Demo Garage','America/New_York','USD') RETURNING id`,
+      [tenantId],
+    )
+  ).rows[0].id;
+
+  const lane = async (name, direction) =>
+    (
+      await c.query(
+        `INSERT INTO lanes (tenant_id, garage_id, name, direction) VALUES ($1,$2,$3,$4) RETURNING id`,
+        [tenantId, garage, name, direction],
+      )
+    ).rows[0].id;
+
+  const entryLane = await lane('Entry 1', 'entry');
+  const exitLane = await lane('Exit 1', 'exit');
+
+  // The price is a PLAN (0012): one flat hourly rule at 2.50, effective from
+  // the beginning of time, stored as the plan store would have it. The
+  // one-figure `rates` table is retired (0016) and nothing prices from it.
+  // Then the gate (0014): the garage states it sells transient parking and
+  // is activated, or the lane's open would be refused `garage_not_active`.
+  const plan = {
+    plan_version: 'flat-250-USD',
+    effective_from: '2000-01-01T00:00:00Z',
+    timezone: 'America/New_York',
+    currency: 'USD',
+    space_classes: ['standard'],
+    resolution: { QUALIFY: { mode: 'cheapest_wins' }, ACCUMULATE: { mode: 'cheapest_wins' } },
+    adjust_order: null,
+    rules: [{
+      id: 'hourly', type: 'increment', stage: 'ACCUMULATE', space_classes: ['standard'],
+      first_period_minutes: 60, first_period_minor: 250, repeat_period_minutes: 60, repeat_period_minor: 250,
+      rounding: 'ceil', max_duration_minutes: null,
+    }],
+    decisions: [],
+  };
+  await c.query(
+    `INSERT INTO rate_plans (tenant_id, garage_id, plan_version, effective_from, document, engine_schema_version)
+     VALUES ($1, $2, $3::jsonb->>'plan_version', ($3::jsonb->>'effective_from')::timestamptz, $3::jsonb, 1)`,
+    [tenantId, garage, JSON.stringify(plan)],
+  );
+  // Its taxes, stated (0022): none. The demo's garage says so in so many
+  // words -- an unstated garage cannot activate.
+  await c.query(
+    `INSERT INTO garage_tax_sets (tenant_id, garage_id, effective_from, rule_count)
+     VALUES ($1, $2, '2000-01-01T00:00:00Z', 0)`,
+    [tenantId, garage],
+  );
+  await c.query(`UPDATE garages SET transient_available = true, activated_at = now() WHERE tenant_id = $1 AND id = $2`, [tenantId, garage]);
+
+  for (const [laneId, token, name] of [
+    [entryLane, entryToken, 'Entry lane controller'],
+    [exitLane, exitToken, 'Exit lane controller'],
+  ]) {
+    await c.query(
+      `INSERT INTO lane_devices (tenant_id, lane_id, name, token_hash) VALUES ($1,$2,$3,$4)`,
+      [tenantId, laneId, name, hashToken(token)],
+    );
+  }
+
+  await c.query(`INSERT INTO operator_tokens (tenant_id, name, token_hash) VALUES ($1,'Demo operator',$2)`,
+    [tenantId, hashToken(operatorTokenValue)]);
+
+  return { garage, entryLane, exitLane };
+});
+
+const port = Number(process.env.PORT || 3000);
+const credentials = {
+  base_url: `http://127.0.0.1:${port}`,
+  tenant_id: tenantId,
+  garage_id: demo.garage,
+  currency: 'USD',
+  entry_token: entryToken,
+  exit_token: exitToken,
+  operator_token: operatorTokenValue,
+};
+// Three live bearer tokens, one of them the operator token that mints device
+// tokens. `writeFileSync`'s mode argument is masked by the umask and is applied
+// only when the file is CREATED, so a permissive umask -- or a file left over
+// from an earlier run -- decides the permissions of a credential file. The
+// chmod is the part that holds: a named mode, applied on every write.
+const CREDENTIALS_FILE_MODE = 0o600;
+writeFileSync('.demo-credentials.json', `${JSON.stringify(credentials, null, 2)}\n`, {
+  mode: CREDENTIALS_FILE_MODE,
+});
+chmodSync('.demo-credentials.json', CREDENTIALS_FILE_MODE);
+
+createApp().listen(port, () => {
+  console.log(`
+──────────────────────────────────────────────────────────────
+ Open Parking AI — demo platform listening on :${port}
+
+   tenant   ${tenantId}
+   garage   ${demo.garage}  (Demo Garage, USD, 2.50/hour)
+   lanes    Entry 1, Exit 1
+
+ Device tokens written to .demo-credentials.json
+ Run the lane against it from the lane-controller repository:
+
+   python -m lane_controller.demo --credentials ../platform/.demo-credentials.json
+
+ Inside count:
+   curl -H "authorization: Bearer ${operatorTokenValue}" \\
+     http://127.0.0.1:${port}/api/v1/garages/${demo.garage}/sessions/open
+──────────────────────────────────────────────────────────────`);
+});
+
+process.on('SIGINT', async () => {
+  await pool.end();
+  process.exit(0);
+});

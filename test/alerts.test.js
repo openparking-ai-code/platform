@@ -213,8 +213,8 @@ function phoneCases() {
   }
   for (const [typed, kept] of [
     ['+44 20 7946 0000', '+442079460000'],
-    ['+52 55 1234 5678', '+525512345678'],
-    ['+49 30 123456', '+4930123456'],
+    ['+52 55 0000 0101', '+525500000101'],
+    ['+49 30 000101', '+4930000101'],
     ['+61 2 5550 4000', '+61255504000'],
     ['+12345678', '+12345678'],
     [`+${digits(15)}`, `+${digits(15)}`],
@@ -374,7 +374,7 @@ test('THE CHOICES HOLD TOGETHER: no text without a phone, no email without an ad
   // An address replaced keeps its choices; one taken away (with a phone given) drops them.
   r = await call(base, 'PATCH', `/garages/${g.id}/alert-contacts/${both.id}`, { as: a, body: { email: 'both.new@example.com' } });
   assert.deepEqual([r.status, r.json.contact.by_email, r.json.turned_off], [200, ['garage_not_answering'], { by_text: [], by_email: [] }]);
-  r = await call(base, 'PATCH', `/garages/${g.id}/alert-contacts/${both.id}`, { as: a, body: send({ email: null, phone: '+52 55 1234 5678' }) });
+  r = await call(base, 'PATCH', `/garages/${g.id}/alert-contacts/${both.id}`, { as: a, body: send({ email: null, phone: '+52 55 0000 0101' }) });
   assert.deepEqual([r.status, r.json.turned_off.by_email, r.json.contact.by_email], [200, ['garage_not_answering'], []]);
   await holds();
 

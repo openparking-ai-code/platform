@@ -2,7 +2,7 @@
   "characters": " !'+,-./0123456789:?ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÑÓÚÜ",
   "source": {
     "repo": "openparking-ai-code/gate-agent",
-    "commit": "bd9c25f87702569245021c7ce46a9c8a10016d0b",
+    "commit": "82664818bc05a10bfa7a240314a998b2286d2447",
     "path": "src/gate_agent/font.py",
     "names": [
       "GLYPHS",

@@ -1,6 +1,6 @@
 name: Nightly fail-controls
 
-# The repository-wide fail-controls, on main, once a night, and nothing else:
+# The repository-wide fail-controls, on main, once a week, and nothing else:
 # ci.yml's three control jobs -- the ones that take seconds (`suite`'s, here
 # `quick-controls`), `controls` and the 8 `sign-in-control` shards -- with the
 # same commands and shards, without the suite, the purge and the lint. What
@@ -11,8 +11,9 @@ name: Nightly fail-controls
 
 on:
   schedule:
-    # 02:17 UTC every night.
-    - cron: '17 2 * * *'
+    # 02:17 UTC every Monday. Once a week, not every night: each run is about
+    # 190 runner minutes, and every pull request runs the same controls.
+    - cron: '17 2 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -133,6 +134,8 @@ jobs:
         run: npm run standalone-arm-fail-control
       - name: Tax-on-the-stay fail-control
         run: npm run tax-on-paid-fail-control
+      - name: Exit-decision fail-control
+        run: npm run exit-decision-fail-control
       - name: A test file whose before throws ends red, not hung
         run: npm run hanging-hooks-control
 
@@ -191,6 +194,8 @@ jobs:
         run: npm run garage-checks-fail-control
       - name: Database-restart fail-control
         run: npm run db-restart-fail-control
+      - name: Linked-accounts fail-control
+        run: npm run linked-accounts-fail-control
 
   sign-in-control:
     name: sign-in-control (${{ matrix.shard }}/8)
